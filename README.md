@@ -17,7 +17,7 @@ A new deployment has no eligible providers until one registers successfully. The
 
 ## Join and leave
 
-Run unmodified Kora behind a public HTTPS URL. Enable `get_config`, `get_payer_signer`, `estimate_transaction_fee` and `sign_and_send_transaction`, and accept NEIRO mint `CTg3ZgYx79zrE1MteDVkmkcGniiFrK1hJ6yiabropump`. Fund your payer and configure your own reimbursement policy.
+Run unmodified Kora behind a public HTTPS URL. Enable `get_config`, `get_payer_signer` and `estimate_transaction_fee`, and accept NEIRO mint `CTg3ZgYx79zrE1MteDVkmkcGniiFrK1hJ6yiabropump`. Fund your payer and configure your own reimbursement policy. Signing methods are operator-controlled: admission does not require `signAndSendTransaction` or `signTransaction`. Sign-only operators can join. The router forwards the requested method unchanged; an unsupported method returns the operator’s error.
 
 ```sh
 curl https://YOUR-ROUTER/operators/register \
