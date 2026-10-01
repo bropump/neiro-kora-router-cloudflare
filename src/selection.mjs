@@ -54,20 +54,26 @@ export function selectOperator(rows, { mode = 'fastest', payer, operatorId, pric
     return {...chosen,selectionBasis:'pinned'};
   }
   if (priceGroup !== undefined && mode === 'cheapest') candidates = candidates.filter(row => normalizePrice(row.price)?.group === priceGroup);
-  // Compare like with like. A cheap getConfig response must never beat another
-  // operator's slower real quote merely because they are different workloads.
-  const realQuote = row => row.quoteStats?.source === 'traffic' && row.quoteStats.region === region && fresh(row.quoteStats.at, now, quoteMaxAgeMs) && validLatency(row.quoteStats.ewmaMs) && row.quoteStats.samples > 0;
-  const allQuotes = candidates.length > 0 && candidates.every(realQuote);
+  // Background samples compare the same workload. Customer quotes can contain
+  // unrelated transfers/swaps and must not change this ranking.
+  const group = value => JSON.stringify([value.template, value.mint]);
+  const identified = value => typeof value?.template === 'string' && !!value.template && typeof value.mint === 'string' && !!value.mint;
+  const regionalSample = row => row.sampleStats?.ok === true && identified(row.sampleStats) && row.sampleStats.region === region && fresh(row.sampleStats.at, now, quoteMaxAgeMs) && validLatency(row.sampleStats.ewmaMs) && Number.isSafeInteger(row.sampleStats.samples) && row.sampleStats.samples > 0;
+  const measured = candidates.filter(regionalSample);
+  const comparableLatency = measured.length > 0 && new Set(measured.map(row => group(row.sampleStats))).size === 1;
+  if (mode === 'fastest' && measured.length && !comparableLatency) throw Error('Incomparable regional sample quotes');
   const configLatency = row => row.configStats && !row.configStats.failed && row.configStats?.region === region && fresh(row.configStats.at, now, healthMaxAgeMs) && validLatency(row.configStats.latencyMs) ? (validLatency(row.configStats.ewmaMs)?row.configStats.ewmaMs:row.configStats.latencyMs) : Infinity;
-  const latency = row => allQuotes ? row.quoteStats.ewmaMs : configLatency(row);
+  const latency = row => comparableLatency ? regionalSample(row) ? row.sampleStats.ewmaMs : Infinity : configLatency(row);
   const coldOrder = new Map(candidates.map(row => [row.id,Math.random()]));
   const compareLatency = (a,b) => (latency(a) === latency(b) ? 0 : latency(a) < latency(b) ? -1 : 1) || (!Number.isFinite(latency(a)) ? coldOrder.get(a.id)-coldOrder.get(b.id) : 0) || a.id.localeCompare(b.id);
-  let selectionBasis = allQuotes ? 'regional real quote latency' : 'regional configuration latency';
+  let selectionBasis = comparableLatency ? 'regional equivalent sample quote latency' : 'regional configuration latency';
   if (mode === 'cheapest') {
     const sample = row => row.sampleQuote;
-    const usable = row => sample(row)?.ok === true && fresh(sample(row).at, now, sampleMaxAgeMs) && typeof sample(row).template === 'string' && !!sample(row).template && typeof sample(row).mint === 'string' && !!sample(row).mint && Number.isSafeInteger(sample(row).feeInToken) && sample(row).feeInToken >= 0;
-    const equivalent = candidates.length > 0 && candidates.every(usable) && new Set(candidates.map(row => JSON.stringify([sample(row).template,sample(row).mint]))).size === 1;
-    if (equivalent) {
+    const usable = row => sample(row)?.ok === true && fresh(sample(row).at, now, sampleMaxAgeMs) && identified(sample(row)) && Number.isSafeInteger(sample(row).feeInToken) && sample(row).feeInToken >= 0;
+    const quoted = candidates.filter(usable);
+    if (quoted.length) {
+      if (new Set(quoted.map(row => group(sample(row)))).size !== 1) throw Error('Incomparable sample quotes');
+      candidates = quoted;
       candidates.sort((a,b) => sample(a).feeInToken - sample(b).feeInToken || compareLatency(a,b));
       selectionBasis = 'lowest fresh comparable sample quote';
     } else {
@@ -86,5 +92,5 @@ export function selectOperator(rows, { mode = 'fastest', payer, operatorId, pric
   } else candidates.sort(compareLatency);
   if (!candidates.length) throw Error('No healthy provider with comparable pricing or latency');
   const chosen=candidates[0];
-  return {...chosen,selectionBasis,latencyBasis:allQuotes?'regional-quote-ewma':Number.isFinite(configLatency(chosen))?'regional-config':'cold-start'};
+  return {...chosen,selectionBasis,latencyBasis:comparableLatency && regionalSample(chosen)?'regional-sample-quote-ewma':!comparableLatency && Number.isFinite(configLatency(chosen))?'regional-config':'cold-start'};
 }

@@ -1,14 +1,20 @@
 import {configCheck} from './policy.mjs';
 import {upstream} from './upstream.mjs';
 
-// Configuration and sample schedules are shared globally. Latency observations
-// remain scoped to their measuring colo; payments never wait for these checks.
+// Measurements are scoped to the serving colo. Shared prices provide a cold
+// region fallback; payments never wait for background operator checks.
 const cacheKey=(origin,region,suffix)=>new Request(`${origin}/_regional/${encodeURIComponent(region)}/${suffix}`);
 const cache=()=>globalThis.caches?.default;
 const safeJSON=text=>{try{return JSON.parse(text);}catch{return null;}};
-async function invalidate(origin,region){await cache()?.delete(cacheKey(origin,region,'stats'));}
+async function failureOverlay(origin,region,id,until){
+ await cache()?.put(cacheKey(origin,region,`failure/${id}`),Response.json({until},{headers:{'cache-control':'max-age=30'}}));
+}
+export async function localFailureUntil(origin,region,id){
+ const hit=await cache()?.match(cacheKey(origin,region,`failure/${id}`));
+ return hit?(await hit.json()).until||0:0;
+}
 async function snapshot(env,region){
- const result=await env.DB.prepare('SELECT operator_id,quote_json,config_json,failed_until,last_probe_at FROM regional_stats WHERE region=?').bind(region).all();
+ const result=await env.DB.prepare('SELECT operator_id,quote_json,config_json,sample_json,failed_until,last_probe_at FROM regional_stats WHERE region=?').bind(region).all();
  return result.results||[];
 }
 // Cache both database reads. A short fallback tolerates a transient D1 outage,
@@ -16,12 +22,19 @@ async function snapshot(env,region){
 async function cachedRead(origin,region,suffix,read,ctx){
  const key=cacheKey(origin,region,suffix),hit=await cache()?.match(key);
  const previous=hit?await hit.json():null,now=Date.now();
- if(previous&&now-previous.at<10000)return previous.rows;
- async function update(){const rows=await read();await cache()?.put(key,Response.json({at:now,rows},{headers:{'cache-control':'max-age=30'}}));return rows;}
+ if(previous&&now>=previous.at&&now-previous.at<60000)return previous.rows;
+ async function update(){const rows=await read();await cache()?.put(key,Response.json({at:now,rows},{headers:{'cache-control':'max-age=120'}}));return rows;}
  // Return bounded local observations while refreshing off the request path.
- if(previous&&now>=previous.at&&now-previous.at<30000&&ctx?.waitUntil){ctx.waitUntil(update().catch(()=>{}));return previous.rows;}
+ if(previous&&now>=previous.at&&now-previous.at<120000&&ctx?.waitUntil){
+  const marker=cacheKey(origin,region,`${suffix}-refreshing`);
+  if(!await cache()?.match(marker)){
+   await cache()?.put(marker,new Response('1',{headers:{'cache-control':'max-age=5'}}));
+   ctx.waitUntil(update().catch(()=>{}));
+  }
+  return previous.rows;
+ }
  try{return await update();}
- catch(error){if(previous&&now>=previous.at&&now-previous.at<30000)return previous.rows;throw error;}
+ catch(error){if(previous&&now>=previous.at&&now-previous.at<120000)return previous.rows;throw error;}
 }
 export async function loadRegional(rows,env,origin,region,ctx){
  const [stats,shared]=await Promise.all([
@@ -29,11 +42,16 @@ export async function loadRegional(rows,env,origin,region,ctx){
   cachedRead(origin,'SHARED','observations',async()=>{const value=await env.DB.prepare('SELECT operator_id,config_json,sample_json FROM operator_observations').all();return value.results||[];},ctx)
  ]);
  const byId=new Map(stats.map(s=>[s.operator_id,s])),globalById=new Map(shared.map(s=>[s.operator_id,s]));
- return rows.map(row=>{const s=byId.get(row.id),global=globalById.get(row.id),config=safeJSON(global?.config_json);return {...row,price:config?.price||row.price,sampleQuote:safeJSON(global?.sample_json),quoteStats:safeJSON(s?.quote_json),configStats:safeJSON(s?.config_json),failedUntil:s?.failed_until||0};});
+ return rows.map(row=>{
+  const s=byId.get(row.id),global=globalById.get(row.id),config=safeJSON(global?.config_json),sample=safeJSON(s?.sample_json);
+  const fresh=sample&&sample.at<=Date.now()&&sample.at>Date.now()-300000;
+  return {...row,price:config?.price||row.price,sampleQuote:fresh?sample:safeJSON(global?.sample_json),sampleStats:fresh?sample:null,
+   quoteStats:safeJSON(s?.quote_json),configStats:safeJSON(s?.config_json),failedUntil:s?.failed_until||0};
+ });
 }
 export function refreshOptions(env,count){
  const integer=(key,fallback,min,max)=>{const n=Number(env[key]??fallback);if(!Number.isSafeInteger(n)||n<min||n>max)throw Error(`Invalid ${key}`);return n;};
- return {batch:integer('REGIONAL_CONFIG_BATCH_SIZE',Math.max(1,Math.min(10000,Math.ceil(count/4))),1,10000),concurrency:integer('CONFIG_CHECK_CONCURRENCY',6,1,32)};
+ return {batch:integer('REGIONAL_CONFIG_BATCH_SIZE',Math.max(1,Math.min(count,10000,Math.max(6,Math.ceil(count/4)))),1,10000),concurrency:integer('CONFIG_CHECK_CONCURRENCY',6,1,32)};
 }
 // INSERT/UPDATE admission is atomic across Worker isolates. Expired rows are
 // reused rather than generating an unbounded new row for every minute.
@@ -45,7 +63,14 @@ async function claim(env,key,maximum,now,period=60000){
 }
 export async function noteQuote(row,env,origin,region,{ok,ms,kind}){
  const now=Date.now(),source=kind==='probe'?'probe':'traffic';
+ // Immediately suppress local failures, even if the persistence write fails.
+ if(!ok&&['transport','protocol'].includes(kind))await failureOverlay(origin,region,row.id,now+30000);
  if(ok&&Number.isFinite(ms)&&ms>=0){
+  // Customer timings are diagnostic, not the sample ranking signal. Avoid a
+  // persistence write per payment; this best-effort local throttle needs no D1.
+  const marker=cacheKey(origin,region,`traffic-recorded/${row.id}`);
+  if(await cache()?.match(marker))return;
+  await cache()?.put(marker,new Response('1',{headers:{'cache-control':'max-age=60'}}));
   // Probe timings never displace fresh real-transaction observations.
   await env.DB.prepare(`INSERT INTO regional_stats(region,operator_id,quote_json,config_json,failed_until)
    VALUES (?,?,json_object('ewmaMs',?,'samples',1,'at',?,'region',?,'source',?),NULL,0)
@@ -60,33 +85,30 @@ export async function noteQuote(row,env,origin,region,{ok,ms,kind}){
    ON CONFLICT(region,operator_id) DO UPDATE SET failed_until=MAX(failed_until,excluded.failed_until)`)
    .bind(region,row.id,now+30000).run();
  }else return;
- await invalidate(origin,region);
+
 }
-// Minute buckets distribute quote sampling over ten minutes. Stable sorted
-// positions give exactly ten samples/minute for a stable 100-operator pool.
-export function quoteBucket(rows,now){const minute=Math.floor(now/60000)%10;return [...rows].sort((a,b)=>a.id.localeCompare(b.id)).filter((_,i)=>i%10===minute);}
+// Stable oldest-first batches spread work across active requests. Per-operator
+// leases enforce the minute interval across isolates; no provider fan-out occurs
+// in the foreground request handler.
+export function quoteBucket(rows){return [...rows].sort((a,b)=>a.id.localeCompare(b.id));}
 export async function refreshRegional(rows,env,origin,region,probe,{onConfig}={}){
  if(!rows.length)return;
- const now=Date.now(),key=cacheKey(origin,region,'refresh');
- const options=refreshOptions(env,rows.length);
- const scheduled=region==='SCHEDULED',configDeadline=now+(scheduled?120000:12000),probeDeadline=now+(scheduled?240000:21000);
+ const now=Date.now(),key=cacheKey(origin,region,'refresh'),options=refreshOptions(env,rows.length);
+ const wakeMs=rows.length<=options.batch?60000:15000;
  if(await cache()?.match(key))return;
- // Shared admission avoids every edge independently scanning the directory.
- // A short sweep lease lets another invocation finish work after interruption;
- // the per-operator leases prevent duplicate upstream checks.
- // Cron must retain a recovery lane for offline rows, which traffic pools omit.
- // Per-operator leases below still deduplicate checks between both lanes.
- const ownsSweep=await claim(env,scheduled?'background:sweep:scheduled':'background:sweep:traffic',1,now,15000);
- await cache()?.put(key,new Response('1',{headers:{'cache-control':'max-age=15'}}));
- async function check(row,regional=false){
-  const leaseKey=regional?`config:regional:${region}:${row.id}`:`config:operator:${row.id}`;
-  if(!await claim(env,leaseKey,1,Math.floor(Date.now()/60000)*60000,60000))return;
+ await cache()?.put(key,new Response('1',{headers:{'cache-control':`max-age=${wakeMs/1000}`}}));
+ if(!await claim(env,`background:sweep:${region}`,1,now,wakeMs))return;
+ const scheduled=region==='SCHEDULED',deadline=now+(scheduled?240000:20000);
+ const local=await snapshot(env,region),byId=new Map(local.map(s=>[s.operator_id,s]));
+ const age=row=>Math.min(safeJSON(byId.get(row.id)?.config_json)?.at||0,safeJSON(byId.get(row.id)?.sample_json)?.at||0);
+ const selected=[...rows].sort((a,b)=>age(a)-age(b)||a.id.localeCompare(b.id)).slice(0,scheduled?rows.length:options.batch);
+ async function check(row){
+  const leaseKey=`config:regional:${region}:${row.id}`;
+  if(!await claim(env,leaseKey,1,Date.now(),60000))return;
   try{
    const response=await upstream(row.url,'getConfig',{},2000);
    configCheck(response.value.result,{signer_address:row.payer,payment_address:row.paymentAddress},env.NEIRO_MINT);
    const value={latencyMs:response.ms,at:Date.now(),region,price:response.value.result.validation_config.price};
-   await env.DB.prepare(`INSERT INTO operator_observations(operator_id,config_json) VALUES (?,?)
-    ON CONFLICT(operator_id) DO UPDATE SET config_json=excluded.config_json`).bind(row.id,JSON.stringify(value)).run();
    await env.DB.prepare(`INSERT INTO regional_stats(region,operator_id,quote_json,config_json,failed_until) VALUES (?,?,NULL,?,0)
     ON CONFLICT(region,operator_id) DO UPDATE SET config_json=json_set(excluded.config_json,'$.ewmaMs',
     CASE WHEN json_extract(regional_stats.config_json,'$.at')>? AND COALESCE(json_extract(regional_stats.config_json,'$.failed'),0)=0
@@ -94,49 +116,51 @@ export async function refreshRegional(rows,env,origin,region,probe,{onConfig}={}
     THEN 0.25*json_extract(excluded.config_json,'$.latencyMs')+0.75*COALESCE(json_extract(regional_stats.config_json,'$.ewmaMs'),json_extract(regional_stats.config_json,'$.latencyMs'))
     ELSE json_extract(excluded.config_json,'$.latencyMs') END),failed_until=0`)
     .bind(region,row.id,JSON.stringify(value),value.at-300000).run();
-   await onConfig?.(row,{ok:true,config:response.value.result,ms:response.ms,at:value.at});
+   // Shared eligibility/config updates are limited globally, while every active
+   // colo retains its own timings. Scheduled checks are the recovery lane.
+   if(await claim(env,`config:operator:${row.id}`,1,Date.now(),60000)){
+    await env.DB.prepare(`INSERT INTO operator_observations(operator_id,config_json) VALUES (?,?)
+     ON CONFLICT(operator_id) DO UPDATE SET config_json=excluded.config_json`).bind(row.id,JSON.stringify(value)).run();
+    await onConfig?.(row,{ok:true,config:response.value.result,ms:response.ms,at:value.at});
+   }
+   byId.set(row.id,{...byId.get(row.id),config_json:JSON.stringify(value)});
   }catch{
-   // Failed or throttled endpoints get a two-minute quiet period.
+   await failureOverlay(origin,region,row.id,Date.now()+30000);
    await env.DB.prepare('UPDATE regional_leases SET reset=MAX(reset,?) WHERE id=?').bind(Date.now()+120000,leaseKey).run();
-   if(!regional)await env.DB.prepare(`INSERT INTO operator_observations(operator_id,config_json) VALUES (?,?) ON CONFLICT(operator_id) DO UPDATE SET config_json=excluded.config_json`).bind(row.id,JSON.stringify({at:Date.now(),failed:true,region})).run();
    await noteQuote(row,env,origin,region,{ok:false,kind:'protocol'});
-   await env.DB.prepare(`UPDATE regional_stats SET config_json=? WHERE region=? AND operator_id=?`)
-    .bind(JSON.stringify({at:Date.now(),region,price:null,latencyMs:null,failed:true}),region,row.id).run();
-   // A regional network failure must not disable a healthy operator globally.
-   if(!regional)await onConfig?.(row,{ok:false,kind:'protocol',at:Date.now()});
+   const value={at:Date.now(),region,price:null,latencyMs:null,failed:true};
+   await env.DB.prepare(`UPDATE regional_stats SET config_json=? WHERE region=? AND operator_id=?`).bind(JSON.stringify(value),region,row.id).run();
+   byId.set(row.id,{...byId.get(row.id),config_json:JSON.stringify(value)});
+   if(scheduled)await onConfig?.(row,{ok:false,kind:'protocol',at:value.at});
   }
  }
- // Four batches/minute target complete coverage/minute, proportional to pool
- // size. The time budget/concurrency still bound each invocation; slow endpoints
- // can delay coverage. Oldest-first resumes unfinished work on the next batch.
- if(!scheduled&&await claim(env,`config:regional-window:${region}`,1,now,15000)){
-  const local=await snapshot(env,region),byId=new Map(local.map(s=>[s.operator_id,s]));
-  const oldest=[...rows].sort((a,b)=>(safeJSON(byId.get(a.id)?.config_json)?.at||0)-(safeJSON(byId.get(b.id)?.config_json)?.at||0)||a.id.localeCompare(b.id)).slice(0,options.batch);
-  for(let i=0;i<oldest.length&&Date.now()<configDeadline;i+=options.concurrency)await Promise.all(oldest.slice(i,i+options.concurrency).map(row=>check(row,true)));
- }
- if(!ownsSweep){await invalidate(origin,region);return;}
- // Bounded batches: no unbounded Promise.all or sleeps occupying request work.
- const observedConfigs=await env.DB.prepare('SELECT operator_id,config_json FROM operator_observations').all();
- const configAt=new Map((observedConfigs.results||[]).map(s=>[s.operator_id,safeJSON(s.config_json)?.at||0]));
- const due=[...rows].sort((a,b)=>(configAt.get(a.id)||0)-(configAt.get(b.id)||0)||a.id.localeCompare(b.id));
- for(let i=0;i<due.length&&Date.now()<configDeadline;i+=options.concurrency)await Promise.all(due.slice(i,i+options.concurrency).map(row=>check(row)));
- if(typeof probe==='function'){
-  const observed=await env.DB.prepare('SELECT operator_id,config_json FROM operator_observations').all();
-  const eligible=new Set((observed.results||[]).filter(s=>{const c=safeJSON(s.config_json);return c&&!c.failed&&c.at>Date.now()-300000;}).map(s=>s.operator_id));
-  const samples=await env.DB.prepare('SELECT operator_id,sample_json FROM operator_observations').all();
-  const sampledAt=new Map((samples.results||[]).map(s=>[s.operator_id,safeJSON(s.sample_json)?.at||0]));
-  const selected=quoteBucket(rows,now).filter(row=>eligible.has(row.id)).sort((a,b)=>(sampledAt.get(a.id)||0)-(sampledAt.get(b.id)||0));
-  async function sample(row){
-   if(!await claim(env,`quote:operator:${row.id}`,1,Math.floor(Date.now()/600000)*600000,600000))return;
-   let result;try{result=await probe(row);}catch{result={ok:false,kind:'transport'};}
-   const at=Date.now();
-   const value={ok:!!result.ok,at,region,template:'unsigned-empty-v1',mint:env.NEIRO_MINT,
-    ...(result.ok?{feeInToken:result.feeInToken,feeInLamports:result.feeInLamports,ms:result.ms}:{kind:result.kind})};
-   await env.DB.prepare(`INSERT INTO operator_observations(operator_id,sample_json) VALUES (?,?)
-    ON CONFLICT(operator_id) DO UPDATE SET sample_json=excluded.sample_json`).bind(row.id,JSON.stringify(value)).run();
+ async function sample(row){
+  const config=safeJSON(byId.get(row.id)?.config_json);
+  if(!config||config.failed||config.at<Date.now()-300000||typeof probe!=='function')return;
+  const leaseKey=`quote:regional:${region}:${row.id}`;
+  if(!await claim(env,leaseKey,1,Date.now(),60000))return;
+  let result;try{result=await probe(row);}catch{result={ok:false,kind:'transport'};}
+  const at=Date.now(),value={ok:!!result.ok,at,region,template:'unsigned-empty-v1',mint:env.NEIRO_MINT,
+   ...(result.ok?{feeInToken:result.feeInToken,feeInLamports:result.feeInLamports,ms:result.ms}:{kind:result.kind})};
+  // Sample EWMA is separate from arbitrary customer transactions. SQL updates
+  // atomically and resets the average after a stale/failed sample.
+  await env.DB.prepare(`INSERT INTO regional_stats(region,operator_id,sample_json) VALUES (?,?,json_set(?,'$.ewmaMs',?,'$.samples',1))
+   ON CONFLICT(region,operator_id) DO UPDATE SET sample_json=json_set(excluded.sample_json,
+    '$.ewmaMs',CASE WHEN json_extract(excluded.sample_json,'$.ok')=1 AND json_extract(regional_stats.sample_json,'$.ok')=1 AND json_extract(regional_stats.sample_json,'$.at')>?
+      THEN 0.25*json_extract(excluded.sample_json,'$.ms')+0.75*json_extract(regional_stats.sample_json,'$.ewmaMs') ELSE json_extract(excluded.sample_json,'$.ms') END,
+    '$.samples',CASE WHEN json_extract(excluded.sample_json,'$.ok')=1 AND json_extract(regional_stats.sample_json,'$.ok')=1 AND json_extract(regional_stats.sample_json,'$.at')>?
+      THEN MIN(COALESCE(json_extract(regional_stats.sample_json,'$.samples'),0)+1,1000000) ELSE 1 END)`)
+   .bind(region,row.id,JSON.stringify(value),result.ok?result.ms:null,at-300000,at-300000).run();
+  // Price observations may be shared across regions; timing never is.
+  if(await claim(env,`quote:shared:${row.id}`,1,Date.now(),60000))await env.DB.prepare(`INSERT INTO operator_observations(operator_id,sample_json) VALUES (?,?)
+   ON CONFLICT(operator_id) DO UPDATE SET sample_json=excluded.sample_json`).bind(row.id,JSON.stringify(value)).run();
+  if(!result.ok){
+   await env.DB.prepare('UPDATE regional_leases SET reset=MAX(reset,?) WHERE id=?').bind(at+120000,leaseKey).run();
    await noteQuote(row,env,origin,region,result);
   }
-  for(let i=0;i<selected.length&&Date.now()<probeDeadline;i+=2)await Promise.all(selected.slice(i,i+2).map(sample));
  }
- await invalidate(origin,region);
+ // Both stages run only under waitUntil/cron. Bounded parallelism and deadlines
+ // allow later batches to resume unfinished work without a huge polling burst.
+ for(let i=0;i<selected.length&&Date.now()<deadline;i+=options.concurrency)await Promise.all(selected.slice(i,i+options.concurrency).map(check));
+ for(let i=0;i<selected.length&&Date.now()<deadline;i+=2)await Promise.all(selected.slice(i,i+2).map(sample));
 }

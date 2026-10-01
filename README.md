@@ -9,7 +9,8 @@ One public JSON-RPC URL routes to independently operated public HTTPS Kora endpo
 3. Set its database ID in `wrangler.jsonc`. Set the Worker name and every router hostname in comma-separated `ROUTER_HOSTS`.
 4. For a new database: `npx wrangler d1 execute neiro-kora-router --remote --file=schema.sql`.
 5. For an existing installation with the old unique-hostname schema, back up its database and apply: `npx wrangler d1 execute neiro-kora-router --remote --file=migrations/0002_multiple_endpoints_per_hostname.sql`.
-6. Deploy with `npx wrangler deploy`. Check `/healthz` and `/operators` on your Worker URL.
+6. For existing installations without regional sample storage, apply `migrations/0003_regional_samples.sql` once. New databases already include it in `schema.sql`.
+7. Deploy with `npx wrangler deploy`. Check `/healthz` and `/operators` on your Worker URL.
 
 There is no fixed 100-operator admission cap. Different paths on the same hostname can register separately. Removing a cap does not prove unlimited capacity: directory and observation reads currently load complete result sets, so D1 response size, memory, CPU and background execution limits remain relevant at large scale. No claim of 1,000 independently hosted production operators is made.
 
@@ -51,9 +52,9 @@ Operators manage their own CDN, rate limits and DDoS protection. Their endpoints
 
 Use `/rpc?selection=fastest` (the default) or `/rpc?selection=cheapest` as the ordinary Kora client endpoint.
 
-Fastest compares fresh real quote timings only when every eligible candidate has a recent real quote observation from the serving Cloudflare colo. Otherwise it compares local configuration-response timings consistently across candidates, smoothed with an EWMA (25% newest observation, 75% previous average; reset after five minutes or failure). An operator's 50ms configuration response is not compared numerically with another operator's 500ms transaction quote. Missing local measurements rank behind measured candidates. An entirely cold comparison chooses provisionally with randomized ties; this is explicitly reported as `cold-start`, not proven fastest. Real quote workloads can still differ by transaction complexity.
+Fastest (also the default Auto behavior) compares fresh EWMA timings of the same background fee-estimate sample from the serving Cloudflare colo. Measured candidates rank ahead of unknown candidates; one missing observation cannot downgrade everyone. When no sample timing is available, local configuration-response timing is a labelled fallback. Entirely cold selection is provisional with randomized ties. Customer transaction timings remain diagnostics: unlike workloads are not mixed into the sample ranking.
 
-Cheapest uses fresh sample amounts when all candidates have successful samples with the same template and payment mint. Samples expire after eleven minutes. Otherwise it falls back to advertised comparable prices. An advertised free provider can be selected ahead of paid pricing. Mixed paid fixed-fee/markup groups require an explicit `priceGroup`, such as `margin` or `fixed:<mint>:<strict>`; URL-encode it. `priceGroup` restricts the candidate group before sample comparison.
+Cheapest compares fresh sample amounts for the same template and payment mint among measured candidates, using regional sample latency to break ties. Unmeasured providers remain in the background rotation. When no usable sample amounts exist, it falls back to advertised comparable prices. Mixed sample templates/mints cannot be compared. Mixed paid fixed-fee/markup groups require an explicit `priceGroup`, such as `margin` or `fixed:<mint>:<strict>`; URL-encode it. `priceGroup` restricts the candidate group before sample comparison.
 
 Samples are unsigned empty transactions, not representative transfer, swap or account-creation quotes. The cheapest sample or advertised markup is **not a guarantee of the lowest final NEIRO payment**. Token conversion, rent, transaction complexity and operator configuration can change the final amount. Kora supplies the actual transaction quote; the merchant must check it before signing. The router does not implement pricing, simulation, sponsorship policy or wallet-balance validation. Eligibility alone does not prove the provider can fund every payment.
 
@@ -65,13 +66,11 @@ Routing diagnostics are in the `x-neiro-routing` response header, exposed throug
 
 ## Background checks and operating cost
 
-The shared schedule targets one configuration check/operator/minute and one sample quote/operator/ten minutes. Each sample also asks Kora for a blockhash. Identity and hosted-proof checks are additional. Configuration requests do not ask the router to contact Solana; quote and blockhash requests may cause Kora to contact its own RPC, depending on Kora and caches.
+Each active colo targets one configuration check and one equivalent sample quote per operator per minute. Each sample asks Kora for a fresh blockhash first. Identity and hosted-proof checks are additional. The router calls only Kora HTTP endpoints; Kora uses its own Solana RPC.
 
-Each active colo separately targets complete regional configuration coverage in one minute: four batches about 15 seconds apart, each sized `ceil(operatorCount/4)`, with six concurrent requests by default. Checks run in background, never as an all-provider scan awaited by the payment. Sparse traffic, slow/failing endpoints or execution limits can delay completion. Oldest-first checks resume unfinished work.
+Bounded oldest-first background batches rotate through all eligible operators. Small pools fit in one batch; larger pools rotate over active requests. Sparse traffic, endpoint timeouts and execution limits can delay coverage. A colo with no traffic does not continuously probe. The minute cron independently refreshes shared eligibility and sample prices under region `SCHEDULED`; its latency is never used as a user's local measurement. Sampling volume therefore scales with active locations, not just operator count.
 
-For 100 operators, targets are **100 shared configuration calls/minute plus 100 regional configuration calls/minute per active colo**, and ten shared sample quotes/minute plus ten blockhash requests/minute. Ten active colos therefore target 1,100 configuration calls/minute, not 100 globally. Shared and regional schedules can overlap in observations; costs scale with active colos, traffic, D1 activity and operator count. Count router HTTP calls separately from downstream Solana RPC calls.
-
-Cron has a separate sweep lease so active traffic cannot displace offline-provider recovery; per-operator leases still deduplicate checks. Cron runs once per minute and uses measurement region `SCHEDULED`; its latency is never treated as user-colo latency. Configuration successes, real quotes and sample quotes retain their measurement timestamps and location. `/operators` exposes public eligibility, pricing and measurement metadata, including verified but currently unhealthy entries marked ineligible.
+Routing snapshots refresh in the background after 60 seconds and can be used for at most 120 seconds, subject to their original measurement expiry. Successful checks do not evict snapshots. Recent local transport failures and HTTP 429/5xx responses exclude an operator for 30 seconds before sending the next request; pinned requests fail rather than switch. Requests are never automatically replayed. `/operators` exposes sample cost, sample timing and customer quote diagnostics separately.
 
 ## Explicit bounds
 
@@ -84,13 +83,13 @@ These are operating defaults or safety boundaries, not claims of unlimited capac
 | Verification cooldown | 60 seconds/registration. |
 | Pending expiry | 15 minutes. |
 | Ownership/identity maintenance | Due after ten minutes; `MAINTENANCE_BATCH_SIZE=100` records/invocation, four concurrent. Larger backlogs take multiple runs. |
-| `REGIONAL_CONFIG_BATCH_SIZE` | Defaults to `ceil(pool/4)`; bounded at 10,000/check batch. Optional override 1–10,000. |
+| `REGIONAL_CONFIG_BATCH_SIZE` | Defaults to `min(pool,max(6,ceil(pool/4)))`; bounded at 10,000/check batch. Optional override 1–10,000. |
 | `CONFIG_CHECK_CONCURRENCY` | Six; configurable 1–32. Platform connection limits still apply. |
-| Background time budgets | Traffic: config 12 seconds, total probe phase 21 seconds. Scheduled: config 120 seconds, probe phase 240 seconds. Platform limits may interrupt earlier. |
-| Background quote concurrency | Two; buckets target one sample/operator/ten minutes. |
-| Health / real quote freshness | Five minutes. Sample cost freshness eleven minutes. |
-| Failure backoff | Configuration failures two minutes; quote transport/protocol failures 30 seconds. Regional connection failure does not globally disable the operator. |
-| Cache | Directory 15 seconds, fallback retaining original five-minute health expiry; observations ten seconds fresh; cached observations under 30 seconds can serve immediately while D1 refresh runs with waitUntil; expired/missing data awaits D1. Bounded 30-second outage fallback. No freshness timestamp is extended. |
+| Background time budgets | Traffic: 20 seconds total. Scheduled: 240 seconds total. Platform limits may interrupt earlier. |
+| Background quote concurrency | Two; targets one sample/operator/minute per active colo and scheduled sweep. |
+| Health / regional sample latency freshness | Five minutes. Sample cost freshness eleven minutes. |
+| Failure backoff | Configuration failures two minutes; transport/protocol failures 30 seconds. Regional connection failure does not globally disable the operator. |
+| Cache | Directory and observations: 60 seconds fresh, background refresh through 120 seconds, then a required D1 read. Original measurement timestamps still govern eligibility. |
 | `MAX_RPC_BODY_BYTES` / `MAX_RPC_RESPONSE_BYTES` | 1,048,576 bytes each; configurable. No separate fixed serialized-transaction-size cap. |
 | `UPSTREAM_TIMEOUT_MS` | 30,000ms for forwarded customer requests; configurable. No automatic retry. |
 | Background timeouts | Config 2 seconds; blockhash 3 seconds; sample quote 4 seconds; proof 5 seconds; admission identity/config 8 seconds each. |
