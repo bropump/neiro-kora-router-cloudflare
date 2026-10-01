@@ -7,7 +7,6 @@ const hash=async s=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',new 
 async function budget(env,key,max){
  const now=Date.now();const result=await env.DB.prepare('INSERT INTO limits (id,n,reset) VALUES (?,1,?) ON CONFLICT(id) DO UPDATE SET n=CASE WHEN reset<=? THEN 1 ELSE n+1 END, reset=CASE WHEN reset<=? THEN ? ELSE reset END WHERE reset<=? OR n<? RETURNING n').bind(key,now+3600000,now,now,now+3600000,now,max).first();return !!result;
 }
-async function save(env,row){await env.DB.prepare('UPDATE operators SET status=?,checked_at=?,data=? WHERE id=?').bind(row.status,row.checkedAt,JSON.stringify(row),row.id).run();}
 function configuredOperators(env){
  const entries=JSON.parse(env.CONFIGURED_OPERATORS||'[]');
  if(!Array.isArray(entries))throw Error('Invalid configured operators');
@@ -16,18 +15,30 @@ function configuredOperators(env){
   return {url:endpoint(x.url,(env.ROUTER_HOSTS||'').split(',')),payer:x.payer,paymentAddress:x.paymentAddress};
  });
 }
-async function check(env,row,identityOnly=false){try{
+async function check(env,row,identityOnly=false,attempt){try{
  const configured=configuredOperators(env).find(x=>x.url===row.url);
  if(!configured&&!await ownership(row)){await removeOperator(env,row.id);row.status='removed';return;}
  if(identityOnly&&row.payer&&row.paymentAddress&&row.verifiedAt&&row.status!=='disabled'){
   const identity=(await upstream(row.url,'getPayerSigner')).value.result;
   if(identity?.signer_address!==row.payer||identity.payment_address!==row.paymentAddress)throw Error('Operator identity changed');
-  row.verifiedAt=Date.now();await save(env,row);return;
+  // Identity inspection owns only verifiedAt; never restore a stale health/status snapshot.
+  await env.DB.prepare("UPDATE operators SET data=json_set(data,'$.verifiedAt',?) WHERE id=? AND last_attempt=?").bind(Date.now(),row.id,attempt).run();return;
  }
  const measured=await inspect(row.url,env.NEIRO_MINT);
  if(configured&&(measured.payer!==configured.payer||measured.paymentAddress!==configured.paymentAddress))throw Error('Configured operator identity changed');
- Object.assign(row,measured,{status:'active',verifiedAt:Date.now()});await save(env,row);
- }catch(e){if(row.status!=='pending')row.status='disabled';row.checkedAt=Date.now();row.verifiedAt=Date.now();await save(env,row);throw e;}}
+ if(row.payer&&(row.payer!==measured.payer||row.paymentAddress!==measured.paymentAddress))throw Error('Operator identity changed; remove and re-register');
+ const now=Date.now();
+ const updated=await env.DB.prepare(`UPDATE operators SET status='active',checked_at=?,data=json_set(data,
+ '$.status','active','$.healthy',json('true'),'$.checkedAt',?,'$.verifiedAt',?,
+ '$.identityBoundAt',COALESCE(json_extract(data,'$.identityBoundAt'),CASE WHEN json_extract(data,'$.payer') IS NOT NULL THEN created_at ELSE ? END),
+ '$.payer',?,'$.paymentAddress',?,'$.latencyMs',?,'$.price',json(?)) WHERE id=? AND last_attempt=? AND checked_at<=? RETURNING status`)
+ .bind(measured.checkedAt,measured.checkedAt,now,now,measured.payer,measured.paymentAddress,measured.latencyMs,JSON.stringify(measured.price??null),row.id,attempt,measured.checkedAt).first();
+ if(updated)row.status='active';
+ }catch(e){
+ const now=Date.now(),status=row.status==='pending'?'pending':'disabled';
+ const updated=await env.DB.prepare("UPDATE operators SET status=?,checked_at=?,data=json_set(data,'$.status',?,'$.healthy',json('false'),'$.checkedAt',?,'$.verifiedAt',?) WHERE id=? AND last_attempt=? RETURNING status").bind(status,now,status,now,now,row.id,attempt).first();
+ if(updated)row.status=status;throw e;
+ }}
 async function removeOperator(env,id){
  await env.DB.batch([env.DB.prepare('DELETE FROM operators WHERE id=?').bind(id),env.DB.prepare('DELETE FROM regional_stats WHERE operator_id=?').bind(id),env.DB.prepare('DELETE FROM operator_observations WHERE operator_id=?').bind(id)]);
 }
@@ -57,7 +68,7 @@ async function enroll(action,input,ip,env){
  if(typeof input.id!=='string'||!/^[a-f0-9]{32}$/.test(input.id))return json({error:'Invalid registration ID'},400);
  const now=Date.now();const stored=await env.DB.prepare('UPDATE operators SET last_attempt=? WHERE id=? AND last_attempt<? RETURNING data').bind(now,input.id,now-60000).first();
  if(!stored)return json({error:'Unknown registration or verification cooldown'},429);
- const row=JSON.parse(stored.data);try{await check(env,row);return json({id:row.id,status:row.status});}catch{return json({id:row.id,status:row.status,error:'Verification or Kora health failed'},422);}
+ const row=JSON.parse(stored.data);try{await check(env,row,false,now);return json({id:row.id,status:row.status});}catch{return json({id:row.id,status:row.status,error:'Verification or Kora health failed'},422);}
  }
  return json({error:'Not found'},404);
 }
@@ -72,7 +83,7 @@ async function maintain(env){
 await env.DB.batch([env.DB.prepare("DELETE FROM operators WHERE status='pending' AND created_at<?").bind(now-900000),env.DB.prepare('DELETE FROM limits WHERE reset<?').bind(now)]);
  const rows=await env.DB.prepare("SELECT id FROM operators WHERE status!='pending' AND COALESCE(json_extract(data,'$.verifiedAt'),0)<? ORDER BY COALESCE(json_extract(data,'$.verifiedAt'),0),id LIMIT ?").bind(now-600000,positiveSetting(env,'MAINTENANCE_BATCH_SIZE',100)).all();
  for(let i=0;i<rows.results.length;i+=4)await Promise.all(rows.results.slice(i,i+4).map(async({id})=>{
- const stored=await env.DB.prepare('UPDATE operators SET last_attempt=? WHERE id=? AND last_attempt<? RETURNING data').bind(now,id,now-60000).first();if(stored)await check(env,JSON.parse(stored.data),true).catch(()=>{});
+ const stored=await env.DB.prepare('UPDATE operators SET last_attempt=? WHERE id=? AND last_attempt<? RETURNING data').bind(now,id,now-60000).first();if(stored)await check(env,JSON.parse(stored.data),true,now).catch(()=>{});
  }));
 }
 async function recordConfig(env,origin,row,event){
@@ -86,7 +97,7 @@ async function recordConfig(env,origin,row,event){
  .bind(status,event.at,status,event.ok?'true':'false',event.at,event.ok?1:0,JSON.stringify(event.config?.validation_config?.price??null),row.id).run();
  await caches.default.delete(new Request(origin+'/_pool'));
 }
-const refresh=(rows,env,origin,region)=>refreshRegional(rows,env,origin,region,row=>probeQuote(row,env.NEIRO_MINT),{onConfig:(row,event)=>recordConfig(env,origin,row,event)});
+const refresh=(rows,env,origin,region)=>refreshRegional(rows.filter(row=>['active','offline'].includes(row.status)),env,origin,region,row=>probeQuote(row,env.NEIRO_MINT),{onConfig:(row,event)=>recordConfig(env,origin,row,event)});
 async function scheduledRefresh(env){
  await maintainIfDue(env);
  const origin='https://'+(env.ROUTER_HOSTS||'router.invalid').split(',')[0];
@@ -100,10 +111,11 @@ async function maintainIfDue(env){
 }
 async function pool(env,ctx,origin){
  const key=new Request(origin+'/_pool'),fallbackKey=new Request(origin+'/_pool-fallback');
- const fresh=rows=>rows.filter(row=>row.status==='active'&&row.checkedAt>Date.now()-300000);
+ const configured=new Set(configuredOperators(env).map(row=>row.url));
+ const fresh=rows=>rows.map(row=>({...row,configured:configured.has(row.url),healthy:row.status==='active'&&row.healthy===true&&row.checkedAt>Date.now()-300000}));
  const cached=await caches.default.match(key);if(cached)return fresh((await cached.json()).rows);
  try{
- const result=await env.DB.prepare("SELECT data FROM operators WHERE status='active' AND checked_at>?").bind(Date.now()-300000).all();
+ const result=await env.DB.prepare("SELECT data FROM operators WHERE status!='pending' AND json_extract(data,'$.payer') IS NOT NULL").all();
  const value={rows:result.results.map(r=>{const {token,...row}=JSON.parse(r.data);return row;})};
  await Promise.all([caches.default.put(key,Response.json(value,{headers:{'cache-control':'max-age=15'}})),caches.default.put(fallbackKey,Response.json(value,{headers:{'cache-control':'max-age=300'}}))]);return fresh(value.rows);
  }catch(error){const fallback=await caches.default.match(fallbackKey);if(!fallback)throw error;return fresh((await fallback.json()).rows);}
@@ -122,9 +134,9 @@ export default {async scheduled(controller,env,ctx){ctx.waitUntil(scheduledRefre
  if(url.pathname==='/healthz')return json({ok:true,mode:'url-enrollment',colo:request.cf?.colo||'unknown'});
  if(!(await env.REQUEST_LIMIT.limit({key:request.headers.get('cf-connecting-ip')||'unknown'})).success)return json({error:'Request limit reached'},429);
  if(['/operators/register','/operators/verify','/operators/remove'].includes(url.pathname)){
-  if(env.ENROLLMENT_OPEN!=='true')return json({error:'Enrollment closed'},503);
+  if(url.pathname!=='/operators/remove'&&env.ENROLLMENT_OPEN!=='true')return json({error:'Enrollment closed'},503);
   if(request.method!=='POST')return json({error:'POST required'},405);
-  try{const value=await bodyJSON(request);return await enroll(url.pathname.split('/').at(-1),value,request.headers.get('cf-connecting-ip')||'unknown',env);}catch{return json({error:'Invalid request'},400);}
+  try{const value=await bodyJSON(request);const result=await enroll(url.pathname.split('/').at(-1),value,request.headers.get('cf-connecting-ip')||'unknown',env);if(url.pathname!=='/operators/register')await Promise.all(['/_pool','/_pool-fallback'].map(path=>caches.default.delete(new Request(url.origin+path))));return result;}catch{return json({error:'Invalid request'},400);}
  }
  if(['/operators','/rpc'].includes(url.pathname))ctx.waitUntil(maintainIfDue(env).catch(()=>{}));
  if(url.pathname==='/operators'&&request.method==='GET'){

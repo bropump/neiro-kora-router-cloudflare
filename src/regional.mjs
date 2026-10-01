@@ -71,7 +71,9 @@ export async function refreshRegional(rows,env,origin,region,probe,{onConfig}={}
  // Shared admission avoids every edge independently scanning the directory.
  // A short sweep lease lets another invocation finish work after interruption;
  // the per-operator leases prevent duplicate upstream checks.
- const ownsSweep=await claim(env,'background:sweep',1,now,15000);
+ // Cron must retain a recovery lane for offline rows, which traffic pools omit.
+ // Per-operator leases below still deduplicate checks between both lanes.
+ const ownsSweep=await claim(env,scheduled?'background:sweep:scheduled':'background:sweep:traffic',1,now,15000);
  await cache()?.put(key,new Response('1',{headers:{'cache-control':'max-age=15'}}));
  async function check(row,regional=false){
   const leaseKey=regional?`config:regional:${region}:${row.id}`:`config:operator:${row.id}`;

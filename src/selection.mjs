@@ -32,18 +32,33 @@ export function recordQuoteSample(previous, { latencyMs, at, region }, { alpha =
 
 export function selectOperator(rows, { mode = 'fastest', payer, operatorId, priceGroup, region, now = Date.now(), healthMaxAgeMs = 300000, quoteMaxAgeMs = 300000, sampleMaxAgeMs = 660000 } = {}) {
   if (!['fastest', 'cheapest'].includes(mode) || !validTime(now) || ![healthMaxAgeMs, quoteMaxAgeMs, sampleMaxAgeMs].every(x => validLatency(x) && x > 0)) throw Error('Invalid selection options');
-  let candidates = rows.filter(row => row.healthy === true && typeof row.id === 'string' && row.id && fresh(row.checkedAt, now, healthMaxAgeMs));
-  if (operatorId !== undefined || payer !== undefined) {
-    candidates = candidates.filter(row => (operatorId === undefined || row.id === operatorId) && (payer === undefined || row.payer === payer));
-    if (candidates.length !== 1) throw Error(candidates.length ? 'Selected payer is ambiguous; pin operator ID' : 'Selected provider unavailable');
-    return {...candidates[0], selectionBasis: 'pinned'};
+  const eligible = row => row.healthy === true && typeof row.id === 'string' && row.id && fresh(row.checkedAt, now, healthMaxAgeMs);
+  // Reported payer identity is not a cryptographic ownership proof. Preserve
+  // the first verified binding so a later duplicate cannot disable/displace it.
+  // Configured endpoints take priority; explicit operator IDs can select a
+  // deliberate alternative without silently failing over signed transactions.
+  const boundAt = row => validTime(row.identityBoundAt) ? row.identityBoundAt : validTime(row.createdAt) ? row.createdAt : 0;
+  const bindings = new Map();
+  for (const row of [...rows].sort((a,b)=>Number(!!b.configured)-Number(!!a.configured)||boundAt(a)-boundAt(b)||a.id.localeCompare(b.id))) {
+    if (!bindings.has(row.payer)) bindings.set(row.payer,row);
+  }
+  let candidates;
+  if (operatorId !== undefined) {
+    candidates=rows.filter(row=>row.id===operatorId&&(payer===undefined||row.payer===payer)&&eligible(row));
+    if(candidates.length!==1)throw Error('Selected provider unavailable');
+    return {...candidates[0],selectionBasis:'pinned'};
+  }
+  candidates=[...bindings.values()].filter(eligible);
+  if(payer!==undefined){
+    const chosen=candidates.find(row=>row.payer===payer);if(!chosen)throw Error('Selected provider unavailable');
+    return {...chosen,selectionBasis:'pinned'};
   }
   if (priceGroup !== undefined && mode === 'cheapest') candidates = candidates.filter(row => normalizePrice(row.price)?.group === priceGroup);
   // Compare like with like. A cheap getConfig response must never beat another
   // operator's slower real quote merely because they are different workloads.
   const realQuote = row => row.quoteStats?.source === 'traffic' && row.quoteStats.region === region && fresh(row.quoteStats.at, now, quoteMaxAgeMs) && validLatency(row.quoteStats.ewmaMs) && row.quoteStats.samples > 0;
   const allQuotes = candidates.length > 0 && candidates.every(realQuote);
-  const configLatency = row => !row.configStats?.failed && row.configStats?.region === region && fresh(row.configStats.at, now, healthMaxAgeMs) && validLatency(row.configStats.latencyMs) ? row.configStats.latencyMs : Infinity;
+  const configLatency = row => row.configStats && !row.configStats.failed && row.configStats?.region === region && fresh(row.configStats.at, now, healthMaxAgeMs) && validLatency(row.configStats.latencyMs) ? row.configStats.latencyMs : Infinity;
   const latency = row => allQuotes ? row.quoteStats.ewmaMs : configLatency(row);
   const coldOrder = new Map(candidates.map(row => [row.id,Math.random()]));
   const compareLatency = (a,b) => (latency(a) === latency(b) ? 0 : latency(a) < latency(b) ? -1 : 1) || (!Number.isFinite(latency(a)) ? coldOrder.get(a.id)-coldOrder.get(b.id) : 0) || a.id.localeCompare(b.id);

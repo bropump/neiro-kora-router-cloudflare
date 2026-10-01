@@ -7,6 +7,6 @@
     "db:apply": "wrangler d1 execute neiro-kora-router --remote --file=schema.sql"
   },
   "devDependencies": {
-    "wrangler": "4.56.0"
+    "wrangler": "4.145.0"
   }
 }
