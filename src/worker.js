@@ -72,8 +72,19 @@ async function enroll(action,input,ip,env){
  }
  return json({error:'Not found'},404);
 }
+// Minute cron prunes abandoned state in bounded batches. Keep a 15-minute
+// grace beyond active measurements and lease deadlines; never delete live leases.
+export async function pruneRoutingState(env,now=Date.now()){
+ const cutoff=now-900000;
+ await env.DB.batch([
+  env.DB.prepare(`DELETE FROM regional_stats WHERE rowid IN (SELECT rowid FROM regional_stats WHERE failed_until<=? AND (operator_id NOT IN (SELECT id FROM operators) OR MAX(COALESCE(json_extract(config_json,'$.at'),0),COALESCE(json_extract(quote_json,'$.at'),0))<?) LIMIT 500)`).bind(now,cutoff),
+  env.DB.prepare(`DELETE FROM operator_observations WHERE rowid IN (SELECT rowid FROM operator_observations WHERE operator_id NOT IN (SELECT id FROM operators) OR MAX(COALESCE(json_extract(config_json,'$.at'),0),COALESCE(json_extract(sample_json,'$.at'),0))<? LIMIT 500)`).bind(cutoff),
+  env.DB.prepare('DELETE FROM regional_leases WHERE rowid IN (SELECT rowid FROM regional_leases WHERE reset<? LIMIT 500)').bind(cutoff)
+ ]);
+}
 async function maintain(env){
  const now=Date.now();
+ await pruneRoutingState(env,now);
  // Deployment-owned public endpoints are trusted admission configuration, not
  // a flag accepted through registration. Identity is rechecked on every refresh.
  for(const entry of configuredOperators(env)){
@@ -141,7 +152,6 @@ export default {async scheduled(controller,env,ctx){ctx.waitUntil(scheduledRefre
   if(request.method!=='POST')return json({error:'POST required'},405);
   try{const value=await bodyJSON(request);const result=await enroll(url.pathname.split('/').at(-1),value,request.headers.get('cf-connecting-ip')||'unknown',env);if(url.pathname!=='/operators/register')await Promise.all(['/_pool','/_pool-fallback'].map(path=>caches.default.delete(new Request(url.origin+path))));return result;}catch{return json({error:'Invalid request'},400);}
  }
- if(['/operators','/rpc'].includes(url.pathname))ctx.waitUntil(maintainIfDue(env).catch(()=>{}));
  if(url.pathname==='/operators'&&request.method==='GET'){
   try{const region=request.cf?.colo||'unknown',baseRows=await pool(routingEnv(),ctx,url.origin);
    ctx.waitUntil(refresh(baseRows,env,url.origin,region).catch(()=>{}));

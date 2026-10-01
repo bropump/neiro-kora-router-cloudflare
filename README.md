@@ -117,3 +117,7 @@ Applications call the Cloudflare Worker, which forwards directly to the operator
 ## D1 routing reads
 
 Enable D1 read replication in the database settings. Routing directory and observation reads share a request-scoped `DB.withSession("first-unconstrained")` session so cache misses can use read replicas. Enrollment, removal, leases and background writes retain the primary binding. Replicas may lag; existing observation and health timestamps still expire normally. Sessions do not guarantee globally immediate removals or eliminate cold-cache database round trips. See [Cloudflare read replication](https://developers.cloudflare.com/d1/best-practices/read-replication/).
+
+## Routing-state cleanup
+
+The minute cron deletes regional measurements and shared observations whose newest measurement is older than 15 minutes, plus orphaned observations. Active regional failure backoff is preserved. Coordination records are deleted 15 minutes after their lease deadline. Each table deletes at most 500 rows per maintenance run, so a backlog drains over subsequent runs. Freshness limits for routing remain five minutes for health/latency and eleven minutes for sample costs; retention does not extend eligibility. Registered operators remain until removal or failed ownership verification. Directory maintenance is scheduled only; payment/list requests no longer acquire its D1 lease.
