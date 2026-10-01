@@ -5,14 +5,25 @@ function decodeKey(value){if(typeof value!=='string'||value.length<32||value.len
 // signatures or account creation. This measures quote service responsiveness,
 // not the price or processing time of an arbitrary customer transaction.
 export function sampleTransaction(payer,blockhash){const wire=new Uint8Array(134);wire[0]=1;wire[65]=1;wire[68]=1;wire.set(decodeKey(payer),69);wire.set(decodeKey(blockhash),101);return btoa(String.fromCharCode(...wire));}
+// Read only the routing address. Kora owns transaction validation; bytes are
+// never rebuilt, signed or changed here. Unknown formats can use an explicit pin.
 export function transactionPayer(encoded){
- if(typeof encoded!=='string'||encoded.length>6000||!/^[A-Za-z0-9+/]*={0,2}$/.test(encoded))throw Error('Invalid transaction');
- const bytes=Uint8Array.from(atob(encoded),c=>c.charCodeAt(0));if(bytes.length>1232)throw Error('Invalid transaction');
- let at=0;const short=()=>{let n=0;for(let i=0;i<3;i++){if(at>=bytes.length)throw Error('Invalid transaction');const b=bytes[at++];if(i===2&&(b&252))throw Error('Invalid transaction');n|=(b&127)<<(i*7);if(!(b&128))return n;}throw Error('Invalid transaction');};
- const sigs=short();if(sigs<1||sigs>19)throw Error('Invalid transaction');at+=sigs*64;if(at>=bytes.length)throw Error('Invalid transaction');
- if(bytes[at]&128){if(bytes[at++]!==128)throw Error('Unsupported transaction version');}
- if(bytes[at]!==sigs)throw Error('Invalid transaction');at+=3;const keys=short();if(keys<1||at+keys*32+33>bytes.length)throw Error('Invalid transaction');
- const key=bytes.slice(at,at+32);let n=0n;for(const b of key)n=n*256n+BigInt(b);let s='';while(n){s=alphabet[Number(n%58n)]+s;n/=58n;}for(const b of key){if(b)break;s='1'+s;}return s;
+ if(typeof encoded!=='string')return undefined;
+ try{
+  const bytes=Uint8Array.from(atob(encoded),c=>c.charCodeAt(0));let at=0;
+  if(bytes[0]===129){
+   // SIMD-0385: version/header/config mask/lifetime/counts, then addresses.
+   if(bytes.length<74||bytes[41]===0)return undefined;at=42;
+  }else{
+   const short=()=>{let n=0;for(let i=0;i<3;i++){if(at>=bytes.length)return NaN;const b=bytes[at++];n|=(b&127)<<(i*7);if(!(b&128))return n;}return NaN;};
+   const sigs=short();if(!Number.isFinite(sigs))return undefined;at+=sigs*64;
+   if(bytes[at]&128){if(bytes[at++]!==128)return undefined;}
+   at+=3;const keys=short();if(!Number.isFinite(keys)||keys<1||at+32>bytes.length)return undefined;
+  }
+  const key=bytes.slice(at,at+32);if(key.length!==32)return undefined;
+  let n=0n;for(const b of key)n=n*256n+BigInt(b);let value='';while(n){value=alphabet[Number(n%58n)]+value;n/=58n;}
+  for(const b of key){if(b)break;value='1'+value;}return value;
+ }catch{return undefined;}
 }
 export async function probeQuote(row,mint){
  try{

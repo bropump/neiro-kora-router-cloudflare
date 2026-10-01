@@ -20,11 +20,17 @@
     "ENROLLMENT_OPEN": "true",
     "ENABLE_SUBMISSIONS": "true",
     "NEIRO_MINT": "CTg3ZgYx79zrE1MteDVkmkcGniiFrK1hJ6yiabropump",
-    "ROUTER_HOSTS": "neiro-kora-router.YOUR-SUBDOMAIN.workers.dev"
+    "ROUTER_HOSTS": "neiro-kora-router.YOUR-SUBDOMAIN.workers.dev",
+    "ADMISSION_REQUESTS_PER_IP_HOUR": "60",
+    "MAINTENANCE_BATCH_SIZE": "100",
+    "CONFIG_CHECK_CONCURRENCY": "6",
+    "MAX_RPC_BODY_BYTES": "1048576",
+    "MAX_RPC_RESPONSE_BYTES": "1048576",
+    "UPSTREAM_TIMEOUT_MS": "30000"
   },
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 0
+    "head_sampling_rate": 0.1
   },
   "d1_databases": [
     {

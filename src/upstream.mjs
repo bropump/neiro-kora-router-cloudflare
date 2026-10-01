@@ -18,3 +18,13 @@ export async function ownership(row){
  if(proof.token!==row.token||typeof proof.enabled!=='boolean')throw Error('Ownership proof mismatch');
  return proof.enabled;
 }
+
+// Customer JSON is forwarded exactly as received, including transaction strings,
+// IDs and parameters. The router does not add signer_key or rewrite transactions.
+export async function forward(url,raw,timeout=30000,maxResponseBytes=1048576){
+ const start=Date.now();const response=await fetch(url,{method:'POST',headers:{'content-type':'application/json','x-neiro-router-hop':'1'},body:raw,redirect:'manual',signal:AbortSignal.timeout(timeout)});
+ if(response.status>=300&&response.status<400)throw Error('Upstream redirect rejected');
+ const text=response.body?await bounded(response,maxResponseBytes):'';
+ let value;try{value=JSON.parse(text);}catch{}
+ return {value,text,status:response.status,ms:Date.now()-start};
+}

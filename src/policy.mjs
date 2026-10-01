@@ -1,4 +1,3 @@
-export const MAX_OPERATORS=100;
 export const REQUIRED=['get_config','get_payer_signer','estimate_transaction_fee','sign_and_send_transaction'];
 export function endpoint(raw, ownHosts=[]){
  if(typeof raw!=='string'||raw.length>256||raw.trim()!==raw)throw Error('Invalid endpoint');

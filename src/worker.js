@@ -1,5 +1,5 @@
-import {endpoint,bodyJSON,json,MAX_OPERATORS} from './policy.mjs';
-import {inspect,ownership,upstream} from './upstream.mjs';
+import {endpoint,bodyJSON,bounded,json} from './policy.mjs';
+import {inspect,ownership,upstream,forward} from './upstream.mjs';
 import {selectOperator,normalizePrice} from './selection.mjs';
 import {loadRegional,noteQuote,refreshRegional} from './regional.mjs';
 import {probeQuote,transactionPayer} from './probe.mjs';
@@ -10,7 +10,7 @@ async function budget(env,key,max){
 async function save(env,row){await env.DB.prepare('UPDATE operators SET status=?,checked_at=?,data=? WHERE id=?').bind(row.status,row.checkedAt,JSON.stringify(row),row.id).run();}
 function configuredOperators(env){
  const entries=JSON.parse(env.CONFIGURED_OPERATORS||'[]');
- if(!Array.isArray(entries)||entries.length>MAX_OPERATORS)throw Error('Invalid configured operators');
+ if(!Array.isArray(entries))throw Error('Invalid configured operators');
  return entries.map(x=>{
   if(!x||typeof x.payer!=='string'||typeof x.paymentAddress!=='string'||![x.payer,x.paymentAddress].every(v=>/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v)))throw Error('Invalid configured identity');
   return {url:endpoint(x.url,(env.ROUTER_HOSTS||'').split(',')),payer:x.payer,paymentAddress:x.paymentAddress};
@@ -18,7 +18,7 @@ function configuredOperators(env){
 }
 async function check(env,row,identityOnly=false){try{
  const configured=configuredOperators(env).find(x=>x.url===row.url);
- if(!configured&&!await ownership(row)){row.status='disabled';row.checkedAt=Date.now();row.verifiedAt=Date.now();await save(env,row);return;}
+ if(!configured&&!await ownership(row)){await removeOperator(env,row.id);row.status='removed';return;}
  if(identityOnly&&row.payer&&row.paymentAddress&&row.verifiedAt&&row.status!=='disabled'){
   const identity=(await upstream(row.url,'getPayerSigner')).value.result;
   if(identity?.signer_address!==row.payer||identity.payment_address!==row.paymentAddress)throw Error('Operator identity changed');
@@ -28,16 +28,30 @@ async function check(env,row,identityOnly=false){try{
  if(configured&&(measured.payer!==configured.payer||measured.paymentAddress!==configured.paymentAddress))throw Error('Configured operator identity changed');
  Object.assign(row,measured,{status:'active',verifiedAt:Date.now()});await save(env,row);
  }catch(e){if(row.status!=='pending')row.status='disabled';row.checkedAt=Date.now();row.verifiedAt=Date.now();await save(env,row);throw e;}}
+async function removeOperator(env,id){
+ await env.DB.batch([env.DB.prepare('DELETE FROM operators WHERE id=?').bind(id),env.DB.prepare('DELETE FROM regional_stats WHERE operator_id=?').bind(id),env.DB.prepare('DELETE FROM operator_observations WHERE operator_id=?').bind(id)]);
+}
+function positiveSetting(env,key,fallback){const n=Number(env[key]??fallback);if(!Number.isSafeInteger(n)||n<1)throw Error('Invalid '+key);return n;}
 async function enroll(action,input,ip,env){
- if(!await budget(env,'ip:'+await hash(ip),6)||!await budget(env,'global',60))return json({error:'Registration limit reached; try later'},429);
+ if(!await budget(env,'ip:'+await hash(ip),positiveSetting(env,'ADMISSION_REQUESTS_PER_IP_HOUR',60)))return json({error:'Registration limit reached; try later'},429);
  if(action==='register'){
  const url=endpoint(input.url,(env.ROUTER_HOSTS||'').split(',')),id=(await hash(url)).slice(0,32);
  await env.DB.prepare("DELETE FROM operators WHERE status='pending' AND created_at<?").bind(Date.now()-900000).run();
  let stored=await env.DB.prepare('SELECT data FROM operators WHERE id=?').bind(id).first();
  if(!stored){const row={id,url,token:crypto.randomUUID()+crypto.randomUUID(),status:'pending',createdAt:Date.now(),checkedAt:0};
- const result=await env.DB.prepare('INSERT OR IGNORE INTO operators (id,host,status,created_at,checked_at,last_attempt,data) SELECT ?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM operators)<?').bind(id,new URL(url).hostname,'pending',row.createdAt,0,0,JSON.stringify(row),MAX_OPERATORS).run();
- stored=await env.DB.prepare('SELECT data FROM operators WHERE id=?').bind(id).first();if(!stored)return json({error:'Hostname already enrolled or enrollment capacity reached'},409);}
+ const result=await env.DB.prepare('INSERT OR IGNORE INTO operators (id,host,status,created_at,checked_at,last_attempt,data) VALUES (?,?,?,?,?,?,?)').bind(id,new URL(url).hostname,'pending',row.createdAt,0,0,JSON.stringify(row)).run();
+ stored=await env.DB.prepare('SELECT data FROM operators WHERE id=?').bind(id).first();if(!stored)return json({error:'Registration could not be stored'},409);}
  const row=JSON.parse(stored.data);return json({id:row.id,status:row.status,verificationUrl:new URL('/.well-known/neiro-router/'+id,url).href,verification:{token:row.token,enabled:true},next:'Serve this JSON at verificationUrl, then POST /operators/verify with id. Keep the file available; no wallet signature or daily renewal.'});
+ }
+ if(action==='remove'){
+ if(typeof input.id!=='string'||!/^[a-f0-9]{32}$/.test(input.id))return json({error:'Invalid registration ID'},400);
+ const stored=await env.DB.prepare('SELECT data FROM operators WHERE id=?').bind(input.id).first();
+ if(!stored)return json({error:'Unknown registration'},404);
+ const row=JSON.parse(stored.data);
+ if(configuredOperators(env).some(x=>x.url===row.url))return json({error:'Configured operator must be removed from deployment configuration'},409);
+ // An ID or public token alone grants no authority: verify the owner-controlled HTTPS proof.
+ if(await ownership(row)!==false)return json({error:'Set enabled:false in the ownership proof before removal'},409);
+ await removeOperator(env,row.id);return json({id:row.id,status:'removed'});
  }
  if(action==='verify'){
  if(typeof input.id!=='string'||!/^[a-f0-9]{32}$/.test(input.id))return json({error:'Invalid registration ID'},400);
@@ -56,7 +70,7 @@ async function maintain(env){
   await env.DB.prepare(`INSERT INTO operators(id,host,status,created_at,checked_at,last_attempt,data) VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status='offline',checked_at=0,data=json_set(operators.data,'$.status','offline','$.checkedAt',0) WHERE operators.status='pending'`).bind(id,new URL(entry.url).hostname,'offline',now,0,0,JSON.stringify(row)).run();
  }
 await env.DB.batch([env.DB.prepare("DELETE FROM operators WHERE status='pending' AND created_at<?").bind(now-900000),env.DB.prepare('DELETE FROM limits WHERE reset<?').bind(now)]);
- const rows=await env.DB.prepare("SELECT id FROM operators WHERE status!='pending' AND COALESCE(json_extract(data,'$.verifiedAt'),0)<? ORDER BY checked_at ASC LIMIT 100").bind(now-600000).all();
+ const rows=await env.DB.prepare("SELECT id FROM operators WHERE status!='pending' AND COALESCE(json_extract(data,'$.verifiedAt'),0)<? ORDER BY COALESCE(json_extract(data,'$.verifiedAt'),0),id LIMIT ?").bind(now-600000,positiveSetting(env,'MAINTENANCE_BATCH_SIZE',100)).all();
  for(let i=0;i<rows.results.length;i+=4)await Promise.all(rows.results.slice(i,i+4).map(async({id})=>{
  const stored=await env.DB.prepare('UPDATE operators SET last_attempt=? WHERE id=? AND last_attempt<? RETURNING data').bind(now,id,now-60000).first();if(stored)await check(env,JSON.parse(stored.data),true).catch(()=>{});
  }));
@@ -76,7 +90,7 @@ const refresh=(rows,env,origin,region)=>refreshRegional(rows,env,origin,region,r
 async function scheduledRefresh(env){
  await maintainIfDue(env);
  const origin='https://'+(env.ROUTER_HOSTS||'router.invalid').split(',')[0];
- const stored=await env.DB.prepare("SELECT data FROM operators WHERE status IN ('active','offline') LIMIT 100").all();
+ const stored=await env.DB.prepare("SELECT data FROM operators WHERE status IN ('active','offline')").all();
  await refresh(stored.results.map(x=>JSON.parse(x.data)),env,origin,'SCHEDULED');
 }
 async function maintainIfDue(env){
@@ -85,8 +99,14 @@ async function maintainIfDue(env){
  if(lease)await maintain(env);
 }
 async function pool(env,ctx,origin){
- const key=new Request(origin+'/_pool');let cached=await caches.default.match(key);if(cached)return (await cached.json()).rows;
- const result=await env.DB.prepare("SELECT data FROM operators WHERE status='active' AND checked_at>? LIMIT 100").bind(Date.now()-300000).all();const value={rows:result.results.map(r=>{const {token,...row}=JSON.parse(r.data);return row;})};await caches.default.put(key,Response.json(value,{headers:{'cache-control':'max-age=15'}}));return value.rows;
+ const key=new Request(origin+'/_pool'),fallbackKey=new Request(origin+'/_pool-fallback');
+ const fresh=rows=>rows.filter(row=>row.status==='active'&&row.checkedAt>Date.now()-300000);
+ const cached=await caches.default.match(key);if(cached)return fresh((await cached.json()).rows);
+ try{
+ const result=await env.DB.prepare("SELECT data FROM operators WHERE status='active' AND checked_at>?").bind(Date.now()-300000).all();
+ const value={rows:result.results.map(r=>{const {token,...row}=JSON.parse(r.data);return row;})};
+ await Promise.all([caches.default.put(key,Response.json(value,{headers:{'cache-control':'max-age=15'}})),caches.default.put(fallbackKey,Response.json(value,{headers:{'cache-control':'max-age=300'}}))]);return fresh(value.rows);
+ }catch(error){const fallback=await caches.default.match(fallbackKey);if(!fallback)throw error;return fresh((await fallback.json()).rows);}
 }
 function regionalCandidates(rows,region){
  const now=Date.now();return rows.map(row=>{
@@ -101,7 +121,7 @@ export default {async scheduled(controller,env,ctx){ctx.waitUntil(scheduledRefre
  if(request.method==='OPTIONS')return new Response(null,{status:204,headers:{'access-control-allow-origin':'*','access-control-allow-methods':'GET, POST, OPTIONS','access-control-allow-headers':'content-type','access-control-max-age':'86400'}});
  if(url.pathname==='/healthz')return json({ok:true,mode:'url-enrollment',colo:request.cf?.colo||'unknown'});
  if(!(await env.REQUEST_LIMIT.limit({key:request.headers.get('cf-connecting-ip')||'unknown'})).success)return json({error:'Request limit reached'},429);
- if(url.pathname==='/operators/register'||url.pathname==='/operators/verify'){
+ if(['/operators/register','/operators/verify','/operators/remove'].includes(url.pathname)){
   if(env.ENROLLMENT_OPEN!=='true')return json({error:'Enrollment closed'},503);
   if(request.method!=='POST')return json({error:'POST required'},405);
   try{const value=await bodyJSON(request);return await enroll(url.pathname.split('/').at(-1),value,request.headers.get('cf-connecting-ip')||'unknown',env);}catch{return json({error:'Invalid request'},400);}
@@ -118,32 +138,44 @@ export default {async scheduled(controller,env,ctx){ctx.waitUntil(scheduledRefre
  if(request.method!=='POST')return json({error:'POST required'},405);
  let id=null,chosen,region=request.cf?.colo||'unknown',isQuote=false;try{
   if(request.headers.has('x-neiro-router-hop'))return json({error:'Routing loop'},400);
-  const body=await bodyJSON(request,65536);id=body.id??null;
-  const allowed=['getConfig','getPayerSigner','getSupportedTokens','getBlockhash','estimateTransactionFee','signAndSendTransaction'];
-  if(body.params===undefined||(Array.isArray(body.params)&&body.params.length===0))body.params={};
-  if(body.jsonrpc!=='2.0'||!allowed.includes(body.method)||!body.params||typeof body.params!=='object'||Array.isArray(body.params))return json({error:'Unsupported request'},400);
-  if(body.method==='signAndSendTransaction'&&env.ENABLE_SUBMISSIONS!=='true')return json({error:'Submissions disabled on test deployment'},403);
+  const raw=await bounded(request,positiveSetting(env,'MAX_RPC_BODY_BYTES',1048576));
+  const body=JSON.parse(raw),batch=Array.isArray(body),calls=batch?body:[body];
+  if(!calls.length||calls.some(call=>!call||call.jsonrpc!=='2.0'||typeof call.method!=='string'))return json({error:'Invalid JSON-RPC request'},400);
+  id=batch?null:body.id??null;
+  if(calls.some(call=>/^(sign|transfer)/i.test(call.method))&&env.ENABLE_SUBMISSIONS!=='true')return json({error:'Submissions disabled'},403);
   const baseRows=await pool(env,ctx,url.origin);
-  // Refresh/probes never block forwarding. D1 leases bound work across isolates.
   ctx.waitUntil(refresh(baseRows,env,url.origin,region).catch(()=>{}));
   const rows=regionalCandidates(await loadRegional(baseRows,env,url.origin,region),region);
-  const queryPayer=url.searchParams.get('provider')||undefined,paramPayer=body.params.signer_key;
-  const transactionMethod=['estimateTransactionFee','signAndSendTransaction'].includes(body.method);
-  const wirePayer=transactionMethod?transactionPayer(body.params.transaction):undefined;
-  const pins=[queryPayer,paramPayer,wirePayer].filter(x=>x!==undefined);
-  if(new Set(pins).size>1)return json({jsonrpc:'2.0',id,error:{code:-32602,message:'Conflicting provider or transaction payer'}},400);
-  const mode=url.searchParams.get('selection')||'fastest',priceGroup=url.searchParams.get('priceGroup')||undefined;
-  chosen=selectOperator(rows,{mode,payer:pins[0],operatorId:url.searchParams.get('operator')||undefined,priceGroup,region});
-  isQuote=body.method==='estimateTransactionFee';
-  const result=await upstream(chosen.url,body.method,{...body.params,signer_key:chosen.payer},body.method==='signAndSendTransaction'?20000:8000);
-  if(isQuote){const v=result.value.result,valid=!result.value.error&&v?.signer_pubkey===chosen.payer&&v.payment_address===chosen.paymentAddress&&Number.isSafeInteger(v.fee_in_lamports)&&v.fee_in_lamports>=0&&(!body.params.fee_token||(Number.isSafeInteger(v.fee_in_token)&&v.fee_in_token>=0));
-   ctx.waitUntil(noteQuote(chosen,env,url.origin,region,{ok:valid,ms:result.ms,kind:valid?'traffic':result.value.error?'business':'protocol'}).catch(()=>{}));
-   if(!result.value.error&&!valid)throw Error('Invalid quote identity or amount');
+  const queryPayer=url.searchParams.get('provider')||undefined,operatorId=url.searchParams.get('operator')||undefined;
+  const pins=[queryPayer];let unknownTransaction=false;
+  for(const call of calls){
+   const params=call.params;
+   if(params&&typeof params==='object'&&!Array.isArray(params)){
+    if(params.signer_key!==undefined)pins.push(params.signer_key);
+    for(const transaction of [params.transaction,...(Array.isArray(params.transactions)?params.transactions:[])]){
+     if(typeof transaction!=='string')continue;
+     const payer=transactionPayer(transaction);if(payer)pins.push(payer);else unknownTransaction=true;
+    }
+   }
   }
-  const q=chosen.quoteStats,quoteFresh=q?.region===region&&q.at<=Date.now()&&Date.now()-q.at<300000;
-  return json({...result.value,id,routing:{provider:chosen.payer,providerId:chosen.id,upstreamMs:result.ms,colo:region,
-   selection:pins.length?'pinned':mode==='cheapest'?'lowest comparable advertised rate':'recent regional quote latency with config fallback',
-   advertisedPrice:normalizePrice(chosen.price),latencySource:quoteFresh?(q.source==='probe'?'regional-probe-ewma':'regional-quote-ewma'):chosen.latencyMs===1e9?'cold-start':'regional-config',
-   quoteEwmaMs:quoteFresh?q.ewmaMs:null,configMs:chosen.latencyMs===1e9?null:chosen.latencyMs}});
- }catch(e){if(chosen&&isQuote)ctx.waitUntil(noteQuote(chosen,env,url.origin,region,{ok:false,kind:'transport'}).catch(()=>{}));const selectionErrors=['Incomparable advertised pricing; specify priceGroup','Invalid selection options','Selected payer is ambiguous; pin operator ID'];return json({jsonrpc:'2.0',id,error:{code:selectionErrors.includes(e.message)?-32602:-32001,message:selectionErrors.includes(e.message)?e.message:'Provider unavailable; submissions are never automatically retried'}},selectionErrors.includes(e.message)?400:503);}
+  const specified=pins.filter(value=>value!==undefined);
+  if(new Set(specified).size>1)return json({jsonrpc:'2.0',id,error:{code:-32602,message:'Conflicting provider or transaction payer'}},400);
+  if(unknownTransaction&&!specified.length&&!operatorId)return json({jsonrpc:'2.0',id,error:{code:-32602,message:'Specify provider or operator for an unrecognized transaction encoding; it will be forwarded unchanged'}},400);
+  const mode=url.searchParams.get('selection')||'fastest',priceGroup=url.searchParams.get('priceGroup')||undefined;
+  chosen=selectOperator(rows,{mode,payer:specified[0],operatorId,priceGroup,region});
+  isQuote=!batch&&body.method==='estimateTransactionFee';
+  const result=await forward(chosen.url,raw,positiveSetting(env,'UPSTREAM_TIMEOUT_MS',30000),positiveSetting(env,'MAX_RPC_RESPONSE_BYTES',1048576));
+  if(isQuote)ctx.waitUntil(noteQuote(chosen,env,url.origin,region,{ok:result.status>=200&&result.status<300&&!!result.value?.result&&!result.value.error,ms:result.ms,kind:result.status>=500?'transport':result.value?.error?'business':'traffic'}).catch(()=>{}));
+  const q=chosen.quoteStats,routing={provider:chosen.payer,providerId:chosen.id,upstreamMs:result.ms,colo:region,
+   selection:chosen.selectionBasis||'pinned',advertisedPrice:normalizePrice(chosen.price),
+   latencySource:chosen.latencyBasis||'cold-start',quoteEwmaMs:chosen.latencyBasis==='regional-quote-ewma'?q?.ewmaMs:null,
+   configMs:chosen.latencyMs===1e9?null:chosen.latencyMs};
+  // Raw upstream response preserves all numbers, errors and transaction bytes.
+  return new Response(result.text||null,{status:result.status,headers:{'content-type':'application/json','access-control-allow-origin':'*','access-control-expose-headers':'x-neiro-routing','cache-control':'no-store','x-neiro-routing':JSON.stringify(routing)}});
+
+ }catch(e){
+  if(chosen&&isQuote)ctx.waitUntil(noteQuote(chosen,env,url.origin,region,{ok:false,kind:'transport'}).catch(()=>{}));
+  const selectionErrors=['Incomparable advertised pricing; specify priceGroup','Invalid selection options','Selected payer is ambiguous; pin operator ID'];
+  return json({jsonrpc:'2.0',id,error:{code:selectionErrors.includes(e.message)?-32602:-32001,message:selectionErrors.includes(e.message)?e.message:'Provider unavailable; requests are never automatically resubmitted'}},selectionErrors.includes(e.message)?400:503);
+ }
 }};
