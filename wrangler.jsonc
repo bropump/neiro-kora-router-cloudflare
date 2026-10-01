@@ -18,7 +18,6 @@
   ],
   "vars": {
     "ENROLLMENT_OPEN": "true",
-    "ENABLE_SUBMISSIONS": "true",
     "NEIRO_MINT": "CTg3ZgYx79zrE1MteDVkmkcGniiFrK1hJ6yiabropump",
     "ROUTER_HOSTS": "neiro-kora-router.YOUR-SUBDOMAIN.workers.dev",
     "ADMISSION_REQUESTS_PER_IP_HOUR": "60",

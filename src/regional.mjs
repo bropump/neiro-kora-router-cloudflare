@@ -13,17 +13,20 @@ async function snapshot(env,region){
 }
 // Cache both database reads. A short fallback tolerates a transient D1 outage,
 // without changing any observation/health timestamps or extending eligibility.
-async function cachedRead(origin,region,suffix,read){
+async function cachedRead(origin,region,suffix,read,ctx){
  const key=cacheKey(origin,region,suffix),hit=await cache()?.match(key);
  const previous=hit?await hit.json():null,now=Date.now();
  if(previous&&now-previous.at<10000)return previous.rows;
- try{const rows=await read();await cache()?.put(key,Response.json({at:now,rows},{headers:{'cache-control':'max-age=30'}}));return rows;}
- catch(error){if(previous&&now-previous.at<30000)return previous.rows;throw error;}
+ async function update(){const rows=await read();await cache()?.put(key,Response.json({at:now,rows},{headers:{'cache-control':'max-age=30'}}));return rows;}
+ // Return bounded local observations while refreshing off the request path.
+ if(previous&&now>=previous.at&&now-previous.at<30000&&ctx?.waitUntil){ctx.waitUntil(update().catch(()=>{}));return previous.rows;}
+ try{return await update();}
+ catch(error){if(previous&&now>=previous.at&&now-previous.at<30000)return previous.rows;throw error;}
 }
-export async function loadRegional(rows,env,origin,region){
+export async function loadRegional(rows,env,origin,region,ctx){
  const [stats,shared]=await Promise.all([
-  cachedRead(origin,region,'stats',()=>snapshot(env,region)),
-  cachedRead(origin,'SHARED','observations',async()=>{const value=await env.DB.prepare('SELECT operator_id,config_json,sample_json FROM operator_observations').all();return value.results||[];})
+  cachedRead(origin,region,'stats',()=>snapshot(env,region),ctx),
+  cachedRead(origin,'SHARED','observations',async()=>{const value=await env.DB.prepare('SELECT operator_id,config_json,sample_json FROM operator_observations').all();return value.results||[];},ctx)
  ]);
  const byId=new Map(stats.map(s=>[s.operator_id,s])),globalById=new Map(shared.map(s=>[s.operator_id,s]));
  return rows.map(row=>{const s=byId.get(row.id),global=globalById.get(row.id),config=safeJSON(global?.config_json);return {...row,price:config?.price||row.price,sampleQuote:safeJSON(global?.sample_json),quoteStats:safeJSON(s?.quote_json),configStats:safeJSON(s?.config_json),failedUntil:s?.failed_until||0};});
@@ -85,8 +88,12 @@ export async function refreshRegional(rows,env,origin,region,probe,{onConfig}={}
    await env.DB.prepare(`INSERT INTO operator_observations(operator_id,config_json) VALUES (?,?)
     ON CONFLICT(operator_id) DO UPDATE SET config_json=excluded.config_json`).bind(row.id,JSON.stringify(value)).run();
    await env.DB.prepare(`INSERT INTO regional_stats(region,operator_id,quote_json,config_json,failed_until) VALUES (?,?,NULL,?,0)
-    ON CONFLICT(region,operator_id) DO UPDATE SET config_json=excluded.config_json,failed_until=0`)
-    .bind(region,row.id,JSON.stringify(value)).run();
+    ON CONFLICT(region,operator_id) DO UPDATE SET config_json=json_set(excluded.config_json,'$.ewmaMs',
+    CASE WHEN json_extract(regional_stats.config_json,'$.at')>? AND COALESCE(json_extract(regional_stats.config_json,'$.failed'),0)=0
+    AND COALESCE(json_extract(regional_stats.config_json,'$.ewmaMs'),json_extract(regional_stats.config_json,'$.latencyMs'))>=0
+    THEN 0.25*json_extract(excluded.config_json,'$.latencyMs')+0.75*COALESCE(json_extract(regional_stats.config_json,'$.ewmaMs'),json_extract(regional_stats.config_json,'$.latencyMs'))
+    ELSE json_extract(excluded.config_json,'$.latencyMs') END),failed_until=0`)
+    .bind(region,row.id,JSON.stringify(value),value.at-300000).run();
    await onConfig?.(row,{ok:true,config:response.value.result,ms:response.ms,at:value.at});
   }catch{
    // Failed or throttled endpoints get a two-minute quiet period.

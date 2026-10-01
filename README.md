@@ -13,7 +13,7 @@ One public JSON-RPC URL routes to independently operated public HTTPS Kora endpo
 
 There is no fixed 100-operator admission cap. Different paths on the same hostname can register separately. Removing a cap does not prove unlimited capacity: directory and observation reads currently load complete result sets, so D1 response size, memory, CPU and background execution limits remain relevant at large scale. No claim of 1,000 independently hosted production operators is made.
 
-A new deployment has no eligible providers until one registers successfully. The template enables admission and submission. `ENROLLMENT_OPEN=false` closes registration and verification; proof-authorized removal remains available; `ENABLE_SUBMISSIONS=false` blocks methods whose names start with `sign` or `transfer`. This switch is not an exhaustive classifier for arbitrary future mutating methods.
+A new deployment has no eligible providers until one registers successfully. The template enables admission. `ENROLLMENT_OPEN=false` closes registration and verification; proof-authorized removal remains available. There is no router-level RPC method allowlist, denylist or submission switch; Kora controls method availability.
 
 ## Join and leave
 
@@ -51,7 +51,7 @@ Operators manage their own CDN, rate limits and DDoS protection. Their endpoints
 
 Use `/rpc?selection=fastest` (the default) or `/rpc?selection=cheapest` as the ordinary Kora client endpoint.
 
-Fastest compares fresh real quote timings only when every eligible candidate has a recent real quote observation from the serving Cloudflare colo. Otherwise it compares local configuration-response timings consistently across candidates. An operator's 50ms configuration response is not compared numerically with another operator's 500ms transaction quote. Missing local measurements rank behind measured candidates. An entirely cold comparison chooses provisionally with randomized ties; this is explicitly reported as `cold-start`, not proven fastest. Real quote workloads can still differ by transaction complexity.
+Fastest compares fresh real quote timings only when every eligible candidate has a recent real quote observation from the serving Cloudflare colo. Otherwise it compares local configuration-response timings consistently across candidates, smoothed with an EWMA (25% newest observation, 75% previous average; reset after five minutes or failure). An operator's 50ms configuration response is not compared numerically with another operator's 500ms transaction quote. Missing local measurements rank behind measured candidates. An entirely cold comparison chooses provisionally with randomized ties; this is explicitly reported as `cold-start`, not proven fastest. Real quote workloads can still differ by transaction complexity.
 
 Cheapest uses fresh sample amounts when all candidates have successful samples with the same template and payment mint. Samples expire after eleven minutes. Otherwise it falls back to advertised comparable prices. An advertised free provider can be selected ahead of paid pricing. Mixed paid fixed-fee/markup groups require an explicit `priceGroup`, such as `margin` or `fixed:<mint>:<strict>`; URL-encode it. `priceGroup` restricts the candidate group before sample comparison.
 
@@ -90,7 +90,7 @@ These are operating defaults or safety boundaries, not claims of unlimited capac
 | Background quote concurrency | Two; buckets target one sample/operator/ten minutes. |
 | Health / real quote freshness | Five minutes. Sample cost freshness eleven minutes. |
 | Failure backoff | Configuration failures two minutes; quote transport/protocol failures 30 seconds. Regional connection failure does not globally disable the operator. |
-| Cache | Directory 15 seconds, fallback retaining original five-minute health expiry; observations ten seconds, bounded 30-second outage fallback. No freshness timestamp is extended. |
+| Cache | Directory 15 seconds, fallback retaining original five-minute health expiry; observations ten seconds fresh; cached observations under 30 seconds can serve immediately while D1 refresh runs with waitUntil; expired/missing data awaits D1. Bounded 30-second outage fallback. No freshness timestamp is extended. |
 | `MAX_RPC_BODY_BYTES` / `MAX_RPC_RESPONSE_BYTES` | 1,048,576 bytes each; configurable. No separate fixed serialized-transaction-size cap. |
 | `UPSTREAM_TIMEOUT_MS` | 30,000ms for forwarded customer requests; configurable. No automatic retry. |
 | Background timeouts | Config 2 seconds; blockhash 3 seconds; sample quote 4 seconds; proof 5 seconds; admission identity/config 8 seconds each. |
@@ -105,3 +105,7 @@ Rate limits and ownership proof reduce some abuse; they are not complete DDoS or
 `CONFIGURED_OPERATORS` optionally supplies deployment-owned public `{url,payer,paymentAddress}` entries. These bypass the hosted proof only after identity inspection. Leave it unset for self-registration only.
 
 The shipped repository contains source, configuration, schema/migration and documentation. Test harnesses, reports, demos, wallets and deployment credentials stay outside it.
+
+## Cloudflare edge routing
+
+Keep default Worker placement near the incoming request; Smart Placement is not enabled. Cloudflare documents regional health measurements with EWMA in [Dynamic Steering](https://developers.cloudflare.com/load-balancing/understand-basics/traffic-steering/steering-policies/dynamic-steering/). This Worker follows that measurement pattern; it does not provision Cloudflare Load Balancing. [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/) entries are local to each data center. [waitUntil](https://developers.cloudflare.com/workers/runtime-apis/context/) keeps bounded refresh work off the response path. Cold/expired caches still need database reads. Request-rate, size, timeout, routing-pin and loop protections remain as documented above; they do not decide which Kora methods or transaction instructions are allowed.

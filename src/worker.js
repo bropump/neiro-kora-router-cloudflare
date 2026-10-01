@@ -142,7 +142,7 @@ export default {async scheduled(controller,env,ctx){ctx.waitUntil(scheduledRefre
  if(url.pathname==='/operators'&&request.method==='GET'){
   try{const region=request.cf?.colo||'unknown',baseRows=await pool(env,ctx,url.origin);
    ctx.waitUntil(refresh(baseRows,env,url.origin,region).catch(()=>{}));
-   const rows=regionalCandidates(await loadRegional(baseRows,env,url.origin,region),region);
+   const rows=regionalCandidates(await loadRegional(baseRows,env,url.origin,region,ctx),region);
    return json({colo:region,operators:rows.map(r=>({id:r.id,payer:r.payer,eligible:!!r.healthy,latencyMs:r.latencyMs===1e9?null:r.latencyMs,price:normalizePrice(r.price),quoteEwmaMs:r.quoteStats?.region===region&&r.quoteStats.at<=Date.now()&&Date.now()-r.quoteStats.at<300000?r.quoteStats.ewmaMs:null,checkedAt:r.checkedAt,sampleQuote:r.sampleQuote?{...r.sampleQuote,stale:Date.now()-r.sampleQuote.at>660000}:null}))});
   }catch{return json({error:'Directory unavailable'},503);}
  }
@@ -154,10 +154,9 @@ export default {async scheduled(controller,env,ctx){ctx.waitUntil(scheduledRefre
   const body=JSON.parse(raw),batch=Array.isArray(body),calls=batch?body:[body];
   if(!calls.length||calls.some(call=>!call||call.jsonrpc!=='2.0'||typeof call.method!=='string'))return json({error:'Invalid JSON-RPC request'},400);
   id=batch?null:body.id??null;
-  if(calls.some(call=>/^(sign|transfer)/i.test(call.method))&&env.ENABLE_SUBMISSIONS!=='true')return json({error:'Submissions disabled'},403);
   const baseRows=await pool(env,ctx,url.origin);
   ctx.waitUntil(refresh(baseRows,env,url.origin,region).catch(()=>{}));
-  const rows=regionalCandidates(await loadRegional(baseRows,env,url.origin,region),region);
+  const rows=regionalCandidates(await loadRegional(baseRows,env,url.origin,region,ctx),region);
   const queryPayer=url.searchParams.get('provider')||undefined,operatorId=url.searchParams.get('operator')||undefined;
   const pins=[queryPayer];let unknownTransaction=false;
   for(const call of calls){
@@ -181,7 +180,7 @@ export default {async scheduled(controller,env,ctx){ctx.waitUntil(scheduledRefre
   const q=chosen.quoteStats,routing={provider:chosen.payer,providerId:chosen.id,upstreamMs:result.ms,colo:region,
    selection:chosen.selectionBasis||'pinned',advertisedPrice:normalizePrice(chosen.price),
    latencySource:chosen.latencyBasis||'cold-start',quoteEwmaMs:chosen.latencyBasis==='regional-quote-ewma'?q?.ewmaMs:null,
-   configMs:chosen.latencyMs===1e9?null:chosen.latencyMs};
+   configMs:chosen.latencyMs===1e9?null:chosen.latencyMs,configEwmaMs:chosen.configStats?.ewmaMs??null};
   // Raw upstream response preserves all numbers, errors and transaction bytes.
   return new Response(result.text||null,{status:result.status,headers:{'content-type':'application/json','access-control-allow-origin':'*','access-control-expose-headers':'x-neiro-routing','cache-control':'no-store','x-neiro-routing':JSON.stringify(routing)}});
 

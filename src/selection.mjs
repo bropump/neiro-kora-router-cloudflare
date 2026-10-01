@@ -58,7 +58,7 @@ export function selectOperator(rows, { mode = 'fastest', payer, operatorId, pric
   // operator's slower real quote merely because they are different workloads.
   const realQuote = row => row.quoteStats?.source === 'traffic' && row.quoteStats.region === region && fresh(row.quoteStats.at, now, quoteMaxAgeMs) && validLatency(row.quoteStats.ewmaMs) && row.quoteStats.samples > 0;
   const allQuotes = candidates.length > 0 && candidates.every(realQuote);
-  const configLatency = row => row.configStats && !row.configStats.failed && row.configStats?.region === region && fresh(row.configStats.at, now, healthMaxAgeMs) && validLatency(row.configStats.latencyMs) ? row.configStats.latencyMs : Infinity;
+  const configLatency = row => row.configStats && !row.configStats.failed && row.configStats?.region === region && fresh(row.configStats.at, now, healthMaxAgeMs) && validLatency(row.configStats.latencyMs) ? (validLatency(row.configStats.ewmaMs)?row.configStats.ewmaMs:row.configStats.latencyMs) : Infinity;
   const latency = row => allQuotes ? row.quoteStats.ewmaMs : configLatency(row);
   const coldOrder = new Map(candidates.map(row => [row.id,Math.random()]));
   const compareLatency = (a,b) => (latency(a) === latency(b) ? 0 : latency(a) < latency(b) ? -1 : 1) || (!Number.isFinite(latency(a)) ? coldOrder.get(a.id)-coldOrder.get(b.id) : 0) || a.id.localeCompare(b.id);
