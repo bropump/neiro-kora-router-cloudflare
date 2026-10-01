@@ -130,6 +130,9 @@ function regionalCandidates(rows,region){
 }
 export default {async scheduled(controller,env,ctx){ctx.waitUntil(scheduledRefresh(env));},async fetch(request,env,ctx){
  const url=new URL(request.url);
+ // Routing snapshots tolerate bounded staleness. Admission and coordination
+ // retain the primary binding; each request owns its read-only session.
+ let readEnv;const routingEnv=()=>readEnv??={...env,DB:env.DB.withSession('first-unconstrained')};
  if(request.method==='OPTIONS')return new Response(null,{status:204,headers:{'access-control-allow-origin':'*','access-control-allow-methods':'GET, POST, OPTIONS','access-control-allow-headers':'content-type','access-control-max-age':'86400'}});
  if(url.pathname==='/healthz')return json({ok:true,mode:'url-enrollment',colo:request.cf?.colo||'unknown'});
  if(!(await env.REQUEST_LIMIT.limit({key:request.headers.get('cf-connecting-ip')||'unknown'})).success)return json({error:'Request limit reached'},429);
@@ -140,9 +143,9 @@ export default {async scheduled(controller,env,ctx){ctx.waitUntil(scheduledRefre
  }
  if(['/operators','/rpc'].includes(url.pathname))ctx.waitUntil(maintainIfDue(env).catch(()=>{}));
  if(url.pathname==='/operators'&&request.method==='GET'){
-  try{const region=request.cf?.colo||'unknown',baseRows=await pool(env,ctx,url.origin);
+  try{const region=request.cf?.colo||'unknown',baseRows=await pool(routingEnv(),ctx,url.origin);
    ctx.waitUntil(refresh(baseRows,env,url.origin,region).catch(()=>{}));
-   const rows=regionalCandidates(await loadRegional(baseRows,env,url.origin,region,ctx),region);
+   const rows=regionalCandidates(await loadRegional(baseRows,routingEnv(),url.origin,region,ctx),region);
    return json({colo:region,operators:rows.map(r=>({id:r.id,payer:r.payer,eligible:!!r.healthy,latencyMs:r.latencyMs===1e9?null:r.latencyMs,price:normalizePrice(r.price),quoteEwmaMs:r.quoteStats?.region===region&&r.quoteStats.at<=Date.now()&&Date.now()-r.quoteStats.at<300000?r.quoteStats.ewmaMs:null,checkedAt:r.checkedAt,sampleQuote:r.sampleQuote?{...r.sampleQuote,stale:Date.now()-r.sampleQuote.at>660000}:null}))});
   }catch{return json({error:'Directory unavailable'},503);}
  }
@@ -154,9 +157,9 @@ export default {async scheduled(controller,env,ctx){ctx.waitUntil(scheduledRefre
   const body=JSON.parse(raw),batch=Array.isArray(body),calls=batch?body:[body];
   if(!calls.length||calls.some(call=>!call||call.jsonrpc!=='2.0'||typeof call.method!=='string'))return json({error:'Invalid JSON-RPC request'},400);
   id=batch?null:body.id??null;
-  const baseRows=await pool(env,ctx,url.origin);
+  const baseRows=await pool(routingEnv(),ctx,url.origin);
   ctx.waitUntil(refresh(baseRows,env,url.origin,region).catch(()=>{}));
-  const rows=regionalCandidates(await loadRegional(baseRows,env,url.origin,region,ctx),region);
+  const rows=regionalCandidates(await loadRegional(baseRows,routingEnv(),url.origin,region,ctx),region);
   const queryPayer=url.searchParams.get('provider')||undefined,operatorId=url.searchParams.get('operator')||undefined;
   const pins=[queryPayer];let unknownTransaction=false;
   for(const call of calls){

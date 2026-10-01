@@ -113,3 +113,7 @@ Keep default Worker placement near the incoming request; Smart Placement is not 
 ## Operator connection
 
 Applications call the Cloudflare Worker, which forwards directly to the operator’s public stock Kora HTTPS endpoint. There is no operator-side Rust router, method-filtering wrapper, or required Caddy proxy. Operators choose their own HTTPS hosting and security. A local development Kora can use an ordinary tunnel directly to its listening port; this is not part of the production router package.
+
+## D1 routing reads
+
+Enable D1 read replication in the database settings. Routing directory and observation reads share a request-scoped `DB.withSession("first-unconstrained")` session so cache misses can use read replicas. Enrollment, removal, leases and background writes retain the primary binding. Replicas may lag; existing observation and health timestamps still expire normally. Sessions do not guarantee globally immediate removals or eliminate cold-cache database round trips. See [Cloudflare read replication](https://developers.cloudflare.com/d1/best-practices/read-replication/).
