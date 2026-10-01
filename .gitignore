@@ -1,0 +1,10 @@
+node_modules/
+.wrangler/
+.dev.vars*
+.env*
+*.log
+*.pem
+*.key
+*keypair*.json
+*secret*.json
+.DS_Store

@@ -1,0 +1,45 @@
+{
+  "name": "neiro-kora-router",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": true,
+  "ratelimits": [
+    {
+      "name": "REQUEST_LIMIT",
+      "namespace_id": "1021",
+      "simple": {
+        "limit": 50,
+        "period": 10
+      }
+    }
+  ],
+  "vars": {
+    "ENROLLMENT_OPEN": "true",
+    "ENABLE_SUBMISSIONS": "true",
+    "NEIRO_MINT": "CTg3ZgYx79zrE1MteDVkmkcGniiFrK1hJ6yiabropump",
+    "ROUTER_HOSTS": "neiro-kora-router.YOUR-SUBDOMAIN.workers.dev"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "neiro-kora-router",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  },
+  "preview_urls": false,
+  "limits": {
+    "cpu_ms": 30000
+  }
+}

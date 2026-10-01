@@ -1,0 +1,12 @@
+{
+  "name": "neiro-kora-router",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "db:apply": "wrangler d1 execute neiro-kora-router --remote --file=schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "4.56.0"
+  }
+}
