@@ -109,3 +109,7 @@ The shipped repository contains source, configuration, schema/migration and docu
 ## Cloudflare edge routing
 
 Keep default Worker placement near the incoming request; Smart Placement is not enabled. Cloudflare documents regional health measurements with EWMA in [Dynamic Steering](https://developers.cloudflare.com/load-balancing/understand-basics/traffic-steering/steering-policies/dynamic-steering/). This Worker follows that measurement pattern; it does not provision Cloudflare Load Balancing. [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/) entries are local to each data center. [waitUntil](https://developers.cloudflare.com/workers/runtime-apis/context/) keeps bounded refresh work off the response path. Cold/expired caches still need database reads. Request-rate, size, timeout, routing-pin and loop protections remain as documented above; they do not decide which Kora methods or transaction instructions are allowed.
+
+## Operator connection
+
+Applications call the Cloudflare Worker, which forwards directly to the operator’s public stock Kora HTTPS endpoint. There is no operator-side Rust router, method-filtering wrapper, or required Caddy proxy. Operators choose their own HTTPS hosting and security. A local development Kora can use an ordinary tunnel directly to its listening port; this is not part of the production router package.
