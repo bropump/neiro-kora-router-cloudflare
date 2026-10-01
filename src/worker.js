@@ -1,4 +1,4 @@
-import {submissionRequest,submissionSuccess,noteSubmission} from './submission.mjs';
+import {submissionRequest,submissionSuccess,noteSubmission,SUBMISSION_MAX_AGE_MS} from './submission.mjs';
 import {endpoint,bodyJSON,bounded,json} from './policy.mjs';
 import {inspect,ownership,upstream,forward} from './upstream.mjs';
 import {selectOperator,normalizePrice} from './selection.mjs';
@@ -79,8 +79,8 @@ export async function pruneRoutingState(env,now=Date.now()){
  const cutoff=now-900000;
  await env.DB.batch([
   env.DB.prepare(`UPDATE regional_stats SET submission_json=(SELECT json_group_array(json(value)) FROM json_each(regional_stats.submission_json) WHERE json_extract(value,'$.at')>?)
-   WHERE rowid IN (SELECT rowid FROM regional_stats WHERE json_extract(submission_json,'$[0].at')<=? LIMIT 500)`).bind(now-600000,now-600000),
-  env.DB.prepare(`DELETE FROM regional_stats WHERE rowid IN (SELECT rowid FROM regional_stats WHERE failed_until<=? AND (operator_id NOT IN (SELECT id FROM operators) OR MAX(COALESCE(json_extract(config_json,'$.at'),0),COALESCE(json_extract(quote_json,'$.at'),0),COALESCE(json_extract(sample_json,'$.at'),0),COALESCE(json_extract(submission_json,'$[#-1].at'),0))<?) LIMIT 500)`).bind(now,cutoff),
+   WHERE rowid IN (SELECT rowid FROM regional_stats WHERE json_extract(submission_json,'$[0].at')<=? LIMIT 500)`).bind(now-SUBMISSION_MAX_AGE_MS,now-SUBMISSION_MAX_AGE_MS),
+  env.DB.prepare(`DELETE FROM regional_stats WHERE rowid IN (SELECT rowid FROM regional_stats WHERE failed_until<=? AND (operator_id NOT IN (SELECT id FROM operators) OR MAX(COALESCE(json_extract(config_json,'$.at'),0),COALESCE(json_extract(quote_json,'$.at'),0),COALESCE(json_extract(sample_json,'$.at'),0))<? AND COALESCE(json_extract(submission_json,'$[#-1].at'),0)<=?) LIMIT 500)`).bind(now,cutoff,now-SUBMISSION_MAX_AGE_MS),
   env.DB.prepare(`DELETE FROM operator_observations WHERE rowid IN (SELECT rowid FROM operator_observations WHERE operator_id NOT IN (SELECT id FROM operators) OR MAX(COALESCE(json_extract(config_json,'$.at'),0),COALESCE(json_extract(sample_json,'$.at'),0))<? LIMIT 500)`).bind(cutoff),
   env.DB.prepare('DELETE FROM regional_leases WHERE rowid IN (SELECT rowid FROM regional_leases WHERE reset<? LIMIT 500)').bind(cutoff)
  ]);

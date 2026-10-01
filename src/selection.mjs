@@ -65,7 +65,7 @@ export function selectOperator(rows, { mode = 'fastest', payer, operatorId, pric
   if (mode === 'fastest' && measured.length && !comparableLatency) throw Error('Incomparable regional sample quotes');
   const configLatency = row => row.configStats && !row.configStats.failed && row.configStats?.region === region && fresh(row.configStats.at, now, healthMaxAgeMs) && validLatency(row.configStats.latencyMs) ? (validLatency(row.configStats.ewmaMs)?row.configStats.ewmaMs:row.configStats.latencyMs) : Infinity;
   const submissionReady = candidates.length > 0 && candidates.every(row=>usableSubmission(row.submissionStats,region,now));
-  const latency = row => submissionReady ? row.submissionStats.medianMs : comparableLatency ? regionalSample(row) ? row.sampleStats.ewmaMs : Infinity : configLatency(row);
+  const latency = row => submissionReady ? row.submissionStats.routing.medianMs : comparableLatency ? regionalSample(row) ? row.sampleStats.ewmaMs : Infinity : configLatency(row);
   const coldOrder = new Map(candidates.map(row => [row.id,Math.random()]));
   const compareLatency = (a,b) => (latency(a) === latency(b) ? 0 : latency(a) < latency(b) ? -1 : 1) || (!Number.isFinite(latency(a)) ? coldOrder.get(a.id)-coldOrder.get(b.id) : 0) || a.id.localeCompare(b.id);
   let selectionBasis = submissionReady ? 'regional sampled submission median' : comparableLatency ? 'regional equivalent sample quote latency' : 'regional configuration latency';
