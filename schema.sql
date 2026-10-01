@@ -9,7 +9,7 @@ CREATE INDEX IF NOT EXISTS operators_status ON operators(status,checked_at);
 -- CF-colo observations and bounded refresh admission; no Durable Objects.
 CREATE TABLE IF NOT EXISTS regional_stats (
  region TEXT NOT NULL, operator_id TEXT NOT NULL,
- quote_json TEXT, config_json TEXT, sample_json TEXT, failed_until INTEGER NOT NULL DEFAULT 0, last_probe_at INTEGER NOT NULL DEFAULT 0,
+ quote_json TEXT, config_json TEXT, sample_json TEXT, submission_json TEXT, failed_until INTEGER NOT NULL DEFAULT 0, last_probe_at INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY (region,operator_id)
 );
 CREATE TABLE IF NOT EXISTS regional_leases (

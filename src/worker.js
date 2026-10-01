@@ -1,3 +1,4 @@
+import {submissionRequest,submissionSuccess,noteSubmission} from './submission.mjs';
 import {endpoint,bodyJSON,bounded,json} from './policy.mjs';
 import {inspect,ownership,upstream,forward} from './upstream.mjs';
 import {selectOperator,normalizePrice} from './selection.mjs';
@@ -77,7 +78,9 @@ async function enroll(action,input,ip,env){
 export async function pruneRoutingState(env,now=Date.now()){
  const cutoff=now-900000;
  await env.DB.batch([
-  env.DB.prepare(`DELETE FROM regional_stats WHERE rowid IN (SELECT rowid FROM regional_stats WHERE failed_until<=? AND (operator_id NOT IN (SELECT id FROM operators) OR MAX(COALESCE(json_extract(config_json,'$.at'),0),COALESCE(json_extract(quote_json,'$.at'),0),COALESCE(json_extract(sample_json,'$.at'),0))<?) LIMIT 500)`).bind(now,cutoff),
+  env.DB.prepare(`UPDATE regional_stats SET submission_json=(SELECT json_group_array(json(value)) FROM json_each(regional_stats.submission_json) WHERE json_extract(value,'$.at')>?)
+   WHERE rowid IN (SELECT rowid FROM regional_stats WHERE json_extract(submission_json,'$[0].at')<=? LIMIT 500)`).bind(now-600000,now-600000),
+  env.DB.prepare(`DELETE FROM regional_stats WHERE rowid IN (SELECT rowid FROM regional_stats WHERE failed_until<=? AND (operator_id NOT IN (SELECT id FROM operators) OR MAX(COALESCE(json_extract(config_json,'$.at'),0),COALESCE(json_extract(quote_json,'$.at'),0),COALESCE(json_extract(sample_json,'$.at'),0),COALESCE(json_extract(submission_json,'$[#-1].at'),0))<?) LIMIT 500)`).bind(now,cutoff),
   env.DB.prepare(`DELETE FROM operator_observations WHERE rowid IN (SELECT rowid FROM operator_observations WHERE operator_id NOT IN (SELECT id FROM operators) OR MAX(COALESCE(json_extract(config_json,'$.at'),0),COALESCE(json_extract(sample_json,'$.at'),0))<? LIMIT 500)`).bind(cutoff),
   env.DB.prepare('DELETE FROM regional_leases WHERE rowid IN (SELECT rowid FROM regional_leases WHERE reset<? LIMIT 500)').bind(cutoff)
  ]);
@@ -165,12 +168,12 @@ export default {async scheduled(controller,env,ctx){ctx.waitUntil(scheduledRefre
   try{const region=request.cf?.colo||'unknown',baseRows=await pool(routingEnv(),ctx,url.origin);
    ctx.waitUntil(refresh(baseRows,env,url.origin,region).catch(()=>{}));
    const rows=regionalCandidates(await loadRegional(baseRows,routingEnv(),url.origin,region,ctx),region);
-   return json({colo:region,operators:rows.map(r=>({id:r.id,payer:r.payer,eligible:!!r.healthy,latencyMs:r.latencyMs===1e9?null:r.latencyMs,price:normalizePrice(r.price),quoteEwmaMs:r.quoteStats?.region===region&&r.quoteStats.at<=Date.now()&&Date.now()-r.quoteStats.at<300000?r.quoteStats.ewmaMs:null,sampleEwmaMs:r.sampleStats?.region===region&&r.sampleStats.at<=Date.now()&&Date.now()-r.sampleStats.at<300000?r.sampleStats.ewmaMs:null,checkedAt:r.checkedAt,sampleQuote:r.sampleQuote?{...r.sampleQuote,stale:Date.now()-r.sampleQuote.at>660000}:null}))});
+   return json({colo:region,operators:rows.map(r=>({id:r.id,payer:r.payer,eligible:!!r.healthy,latencyMs:r.latencyMs===1e9?null:r.latencyMs,price:normalizePrice(r.price),submissionStats:r.submissionStats,quoteEwmaMs:r.quoteStats?.region===region&&r.quoteStats.at<=Date.now()&&Date.now()-r.quoteStats.at<300000?r.quoteStats.ewmaMs:null,sampleEwmaMs:r.sampleStats?.region===region&&r.sampleStats.at<=Date.now()&&Date.now()-r.sampleStats.at<300000?r.sampleStats.ewmaMs:null,checkedAt:r.checkedAt,sampleQuote:r.sampleQuote?{...r.sampleQuote,stale:Date.now()-r.sampleQuote.at>660000}:null}))});
   }catch{return json({error:'Directory unavailable'},503);}
  }
  if(url.pathname!=='/rpc')return json({error:'Not found'},404);
  if(request.method!=='POST')return json({error:'POST required'},405);
- let id=null,chosen,region=request.cf?.colo||'unknown',isQuote=false;try{
+ let id=null,chosen,region=request.cf?.colo||'unknown',isQuote=false,submissionBody,forwardStarted;try{
   if(request.headers.has('x-neiro-router-hop'))return json({error:'Routing loop'},400);
   const raw=await bounded(request,positiveSetting(env,'MAX_RPC_BODY_BYTES',1048576));
   const body=JSON.parse(raw),batch=Array.isArray(body),calls=batch?body:[body];
@@ -203,17 +206,20 @@ export default {async scheduled(controller,env,ctx){ctx.waitUntil(scheduledRefre
    rows.find(row=>row.id===chosen.id).healthy=false;chosen=undefined;
   }
   isQuote=!batch&&body.method==='estimateTransactionFee';
+  submissionBody=submissionRequest(body)?body:undefined;forwardStarted=Date.now();
   const result=await forward(chosen.url,raw,positiveSetting(env,'UPSTREAM_TIMEOUT_MS',30000),positiveSetting(env,'MAX_RPC_RESPONSE_BYTES',1048576));
+  if(submissionBody)ctx.waitUntil(noteSubmission(chosen,env,url.origin,region,{ok:result.status>=200&&result.status<300&&submissionSuccess(submissionBody,result.value),ms:result.ms}).catch(()=>{}));
   if(!isQuote&&(result.status>=500||result.status===429))ctx.waitUntil(noteQuote(chosen,env,url.origin,region,{ok:false,kind:'transport'}).catch(()=>{}));
   if(isQuote)ctx.waitUntil(noteQuote(chosen,env,url.origin,region,{ok:result.status>=200&&result.status<300&&!!result.value?.result&&!result.value.error,ms:result.ms,kind:result.status>=500||result.status===429?'transport':result.value?.error?'business':'traffic'}).catch(()=>{}));
   const q=chosen.sampleStats,routing={provider:chosen.payer,providerId:chosen.id,upstreamMs:result.ms,colo:region,
    selection:chosen.selectionBasis||'pinned',advertisedPrice:normalizePrice(chosen.price),
-   latencySource:chosen.latencyBasis||'cold-start',quoteEwmaMs:chosen.latencyBasis==='regional-sample-quote-ewma'?q?.ewmaMs:null,
+   latencySource:chosen.latencyBasis||'cold-start',submissionStats:chosen.submissionStats??null,quoteEwmaMs:chosen.latencyBasis==='regional-sample-quote-ewma'?q?.ewmaMs:null,
    configMs:chosen.latencyMs===1e9?null:chosen.latencyMs,configEwmaMs:chosen.configStats?.ewmaMs??null};
   // Raw upstream response preserves all numbers, errors and transaction bytes.
   return new Response(result.text||null,{status:result.status,headers:{'content-type':'application/json','access-control-allow-origin':'*','access-control-expose-headers':'x-neiro-routing','cache-control':'no-store','x-neiro-routing':JSON.stringify(routing)}});
 
  }catch(e){
+  if(chosen&&submissionBody&&forwardStarted!==undefined)ctx.waitUntil(noteSubmission(chosen,env,url.origin,region,{ok:false,ms:Date.now()-forwardStarted}).catch(()=>{}));
   if(chosen)ctx.waitUntil(noteQuote(chosen,env,url.origin,region,{ok:false,kind:'transport'}).catch(()=>{}));
   const selectionErrors=['Incomparable advertised pricing; specify priceGroup','Invalid selection options','Selected payer is ambiguous; pin operator ID','Incomparable sample quotes','Incomparable regional sample quotes'];
   return json({jsonrpc:'2.0',id,error:{code:selectionErrors.includes(e.message)?-32602:-32001,message:selectionErrors.includes(e.message)?e.message:'Provider unavailable; requests are never automatically resubmitted'}},selectionErrors.includes(e.message)?400:503);

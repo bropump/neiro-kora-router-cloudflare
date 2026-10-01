@@ -1,3 +1,4 @@
+import {summarizeSubmissions} from './submission.mjs';
 import {configCheck} from './policy.mjs';
 import {upstream} from './upstream.mjs';
 
@@ -14,7 +15,7 @@ export async function localFailureUntil(origin,region,id){
  return hit?(await hit.json()).until||0:0;
 }
 async function snapshot(env,region){
- const result=await env.DB.prepare('SELECT operator_id,quote_json,config_json,sample_json,failed_until,last_probe_at FROM regional_stats WHERE region=?').bind(region).all();
+ const result=await env.DB.prepare('SELECT operator_id,quote_json,config_json,sample_json,submission_json,failed_until,last_probe_at FROM regional_stats WHERE region=?').bind(region).all();
  return result.results||[];
 }
 // Cache both database reads. A short fallback tolerates a transient D1 outage,
@@ -46,7 +47,7 @@ export async function loadRegional(rows,env,origin,region,ctx){
   const s=byId.get(row.id),global=globalById.get(row.id),config=safeJSON(global?.config_json),sample=safeJSON(s?.sample_json);
   const fresh=sample&&sample.at<=Date.now()&&sample.at>Date.now()-300000;
   return {...row,price:config?.price||row.price,sampleQuote:fresh?sample:safeJSON(global?.sample_json),sampleStats:fresh?sample:null,
-   quoteStats:safeJSON(s?.quote_json),configStats:safeJSON(s?.config_json),failedUntil:s?.failed_until||0};
+   submissionStats:summarizeSubmissions(safeJSON(s?.submission_json),region),quoteStats:safeJSON(s?.quote_json),configStats:safeJSON(s?.config_json),failedUntil:s?.failed_until||0};
  });
 }
 export function refreshOptions(env,count){
