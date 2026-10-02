@@ -23,6 +23,7 @@ export interface ReadEnv extends Settings {
 export type OperatorStatus =
   "pending" | "active" | "offline" | "disabled" | "removed";
 export interface Registration {
+  hostingRegions?: string[];
   id: string;
   url: string;
   token?: string;
@@ -51,6 +52,7 @@ export interface Operator extends Registration {
   latencyBasis?: string;
 }
 export interface ConfiguredOperator {
+  hostingRegions?: string[];
   url: string;
   payer: string;
   paymentAddress: string;

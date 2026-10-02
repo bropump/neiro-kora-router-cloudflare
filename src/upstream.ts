@@ -5,6 +5,21 @@ import type {
   RpcEnvelope,
 } from "./types.js";
 import { bounded, configCheck } from "./policy.js";
+// Optional owner-reported display metadata. Never used for routing or eligibility.
+export function hostingRegions(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 16) return [];
+  if (
+    !value.every(
+      (v) =>
+        typeof v === "string" &&
+        v.trim().length > 0 &&
+        v.length <= 80 &&
+        !/[\u0000-\u001f\u007f]/.test(v),
+    )
+  )
+    return [];
+  return [...new Set(value.map((v: string) => v.trim()))];
+}
 // Cloudflare global fetch only: no VPC bindings, credentials, cookies or caller headers.
 // Private networking must never be bound to this deployment. Redirects are forbidden.
 export async function upstream<T = Record<string, unknown>>(
@@ -52,12 +67,14 @@ export async function ownership(row: Registration) {
     headers: { accept: "application/json" },
   });
   if (!response.ok) throw Error("Ownership proof unavailable");
-  const proof = JSON.parse(await bounded(response, 1024)) as {
+  const proof = JSON.parse(await bounded(response, 4096)) as {
     token?: unknown;
     enabled?: unknown;
+    hostingRegions?: unknown;
   };
   if (proof.token !== row.token || typeof proof.enabled !== "boolean")
     throw Error("Ownership proof mismatch");
+  row.hostingRegions = hostingRegions(proof.hostingRegions);
   return proof.enabled;
 }
 

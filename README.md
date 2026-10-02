@@ -45,3 +45,13 @@ For a custom domain, add a `routes` entry such as `{ "pattern": "api.mainnet-bet
 A new deployment needs an operator to register before it can route payments. Operator endpoints stay public; operators manage their own security and availability.
 
 [Routing, caching and limits](docs/OPERATIONS.md) · [Database upgrades](docs/UPGRADING.md)
+
+### Operator hosting locations
+
+The dashboard shows operator hosting locations separately from Cloudflare measurement locations. To publish yours, add an optional `hostingRegions` list to your existing verification JSON, keeping its token and enabled flag:
+
+```json
+{"token":"YOUR_EXISTING_TOKEN","enabled":true,"hostingRegions":["Frankfurt, Germany","Singapore","New York, USA"]}
+```
+
+Use your actual hosting locations. These are operator-reported labels, not independently verified locations, and do not influence routing. One endpoint can list several regions. Call `/operators/verify` after updating the file; periodic ownership checks also pick up changes. Omit the field or use an empty list to clear it. Up to 16 labels of 80 characters each are supported. Deployment-configured operators use the same optional field in their `CONFIGURED_OPERATORS` entry. Kora configuration remains unchanged.

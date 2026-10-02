@@ -28,7 +28,13 @@ import {
   SUBMISSION_MAX_AGE_MS,
 } from "./submission.js";
 import { endpoint, bodyJSON, bounded, json } from "./policy.js";
-import { inspect, ownership, upstream, forward } from "./upstream.js";
+import {
+  inspect,
+  ownership,
+  upstream,
+  forward,
+  hostingRegions,
+} from "./upstream.js";
 import { selectOperator, normalizePrice } from "./selection.js";
 import {
   loadRegional,
@@ -69,6 +75,7 @@ function configuredOperators(env: Settings): ConfiguredOperator[] {
       throw Error("Invalid configured identity");
     return {
       url: endpoint(x.url, (env.ROUTER_HOSTS || "").split(",")),
+      hostingRegions: hostingRegions(x.hostingRegions),
       payer: x.payer,
       paymentAddress: x.paymentAddress,
     };
@@ -87,6 +94,7 @@ async function check(
       row.status = "removed";
       return;
     }
+    if (configured) row.hostingRegions = configured.hostingRegions || [];
     if (
       identityOnly &&
       row.payer &&
@@ -101,11 +109,16 @@ async function check(
         identity.payment_address !== row.paymentAddress
       )
         throw Error("Operator identity changed");
-      // Identity inspection owns only verifiedAt; never restore a stale health/status snapshot.
+      // Refresh ownership metadata without restoring a stale health/status snapshot.
       await env.DB.prepare(
-        "UPDATE operators SET data=json_set(data,'$.verifiedAt',?) WHERE id=? AND last_attempt=?",
+        "UPDATE operators SET data=json_set(data,'$.verifiedAt',?,'$.hostingRegions',json(?)) WHERE id=? AND last_attempt=?",
       )
-        .bind(Date.now(), row.id, attempt)
+        .bind(
+          Date.now(),
+          JSON.stringify(row.hostingRegions || []),
+          row.id,
+          attempt,
+        )
         .run();
       return;
     }
@@ -127,7 +140,7 @@ async function check(
       `UPDATE operators SET status='active',checked_at=?,data=json_set(data,
  '$.status','active','$.healthy',json('true'),'$.checkedAt',?,'$.verifiedAt',?,
  '$.identityBoundAt',COALESCE(json_extract(data,'$.identityBoundAt'),CASE WHEN json_extract(data,'$.payer') IS NOT NULL THEN created_at ELSE ? END),
- '$.payer',?,'$.paymentAddress',?,'$.latencyMs',?,'$.price',json(?)) WHERE id=? AND last_attempt=? AND checked_at<=? RETURNING status`,
+ '$.payer',?,'$.paymentAddress',?,'$.latencyMs',?,'$.price',json(?),'$.hostingRegions',json(?)) WHERE id=? AND last_attempt=? AND checked_at<=? RETURNING status`,
     )
       .bind(
         measured.checkedAt,
@@ -138,6 +151,7 @@ async function check(
         measured.paymentAddress,
         measured.latencyMs,
         JSON.stringify(measured.price ?? null),
+        JSON.stringify(row.hostingRegions || []),
         row.id,
         attempt,
         measured.checkedAt,
@@ -636,6 +650,7 @@ export default {
           operators: rows.map((r) => ({
             id: r.id,
             payer: r.payer,
+            hostingRegions: r.hostingRegions || [],
             eligible: !!r.healthy,
             latencyMs: r.latencyMs === 1e9 ? null : r.latencyMs,
             price: normalizePrice(r.price),
