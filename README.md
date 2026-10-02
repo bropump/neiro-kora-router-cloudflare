@@ -4,6 +4,8 @@ One Cloudflare URL for independent Kora operators. Routes requests by regional r
 
 **Live endpoint:** `https://api.mainnet-beta.neiropay.app/rpc`
 
+[Live network dashboard](https://api.mainnet-beta.neiropay.app/dashboard) — operator fees and recent response times from Cloudflare locations with traffic.
+
 ## Use it
 
 Set your Kora client's endpoint to:

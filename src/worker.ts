@@ -1,3 +1,4 @@
+import { dashboard, measurements } from "./dashboard.js";
 import { isRecord } from "./types.js";
 import type {
   CachedRows,
@@ -527,6 +528,29 @@ export default {
       ).success
     )
       return json({ error: "Request limit reached" }, 429);
+    if (url.pathname === "/dashboard" && request.method === "GET")
+      return new Response(dashboard, {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "content-security-policy":
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+          "x-content-type-options": "nosniff",
+          "referrer-policy": "no-referrer",
+        },
+      });
+    if (url.pathname === "/network/measurements" && request.method === "GET") {
+      const key = new Request(url.origin + "/_dashboard-measurements");
+      const cached = await caches.default.match(key);
+      if (cached) return cached;
+      try {
+        const response = json(await measurements(routingEnv()));
+        response.headers.set("cache-control", "public, max-age=30");
+        ctx.waitUntil(caches.default.put(key, response.clone()));
+        return response;
+      } catch {
+        return json({ error: "Measurements unavailable" }, 503);
+      }
+    }
     if (
       [
         "/operators/register",

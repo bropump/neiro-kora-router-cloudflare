@@ -90,3 +90,7 @@ The minute cron deletes regional rows and shared observations whose newest quote
 The router source is strict TypeScript, compiled by Wrangler. Run `npm run typecheck` and `npm run format:check` before deployment; `npm run deploy` also runs the type checker. GitHub Actions checks types, formatting and the Worker build on pull requests and main pushes. Cloudflare binding types and development tools are pinned in the lockfile. Network JSON still passes through the existing runtime checks, and forwarded transaction/response bytes remain unchanged.
 
 The TypeScript migration requires no database migration or operator changes.
+
+## Public dashboard
+
+`GET /dashboard` displays the existing operator directory and regional sample response times. `GET /network/measurements` exposes only operator IDs, Cloudflare location codes, timestamps, freshness and sample latency, cached for 30 seconds and limited to 5,000 rows. Scheduled/unknown locations are excluded. Samples over five minutes old cannot rank; records over fifteen minutes old are omitted. The dashboard refreshes every minute and clears results on refresh failure. Visiting it triggers the existing local directory probes; it does not trigger probes at every Cloudflare location. No new transaction submissions or schema changes. Both routes use the existing request rate limiter.
