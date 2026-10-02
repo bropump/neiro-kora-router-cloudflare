@@ -503,9 +503,18 @@ export default {
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil(scheduledRefresh(env));
     ctx.waitUntil(
-      reconcileActivity(env).catch(() =>
-        console.error("activity_confirmation_failed"),
-      ),
+      reconcileActivity(env).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : "unknown";
+        console.error("activity_confirmation_failed", {
+          name: error instanceof Error ? error.name : typeof error,
+          reason:
+            /^(Signature status RPC HTTP \d{3}|Invalid signature status response)$/.test(
+              message,
+            )
+              ? message
+              : "unclassified",
+        });
+      }),
     );
   },
   async fetch(request, env, ctx) {

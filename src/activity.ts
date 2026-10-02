@@ -95,10 +95,11 @@ export async function signatureStatuses(
       method: "getSignatureStatuses",
       params: [signatures, { searchTransactionHistory: true }],
     }),
-    redirect: "error",
+    // Workers supports manual redirects; reject non-success responses below.
+    redirect: "manual",
     signal: AbortSignal.timeout(10000),
   });
-  if (!r.ok) throw Error("Signature status RPC unavailable");
+  if (!r.ok) throw Error("Signature status RPC HTTP " + r.status);
   const j: unknown = JSON.parse(await bounded(r, 262144));
   if (
     !isRecord(j) ||
