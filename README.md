@@ -2,7 +2,7 @@
 
 One Cloudflare URL for independent Kora operators. Routes requests by regional response time or estimated fee, with transaction contents unchanged.
 
-**Live endpoint:** `https://neiro-cf-router-demo.optical.workers.dev/rpc`
+**Live endpoint:** `https://api.mainnet-beta.neiropay.app/rpc`
 
 ## Use it
 
@@ -37,6 +37,8 @@ Set the database ID, Worker name and `ROUTER_HOSTS` in `wrangler.jsonc`, then:
 npx wrangler d1 execute neiro-kora-router --remote --file=schema.sql
 npm run deploy
 ```
+
+For a custom domain, add a `routes` entry such as `{ "pattern": "api.mainnet-beta.neiropay.app", "custom_domain": true }` to the deployment config. Set `ROUTER_HOSTS` to all router hostnames, comma-separated, with the primary hostname first. The NEIRO deployment uses `api.mainnet-beta.neiropay.app,neiro-cf-router-demo.optical.workers.dev`; keep both so loop prevention also covers the previous address. Use your own domain for an independent router.
 
 A new deployment needs an operator to register before it can route payments. Operator endpoints stay public; operators manage their own security and availability.
 
