@@ -21,7 +21,7 @@ A new deployment has no eligible providers until one registers successfully. The
 
 Run unmodified Kora behind a public HTTPS URL. Enable `get_config`, `get_payer_signer` and `estimate_transaction_fee`, and accept NEIRO mint `CTg3ZgYx79zrE1MteDVkmkcGniiFrK1hJ6yiabropump`. Fund your payer and configure your own reimbursement policy. Signing methods are operator-controlled: admission does not require `signAndSendTransaction` or `signTransaction`. Sign-only operators can join. The router forwards the requested method unchanged; an unsupported method returns the operator’s error.
 
-Our current recommendation for broad program compatibility is `allowed_programs = "All"` with `max_allowed_lamports = 250000000` (0.25 SOL). This accepts arbitrary program IDs; it does not establish arbitrary-program sponsor safety or measured 90% transaction acceptance. Keep reimbursement and fee-payer policies configured. See [the Kora configuration recommendation and prepared #683 migration](docs/KORA-CONFIGURATION.md).
+The Kora operator template, recommended settings and upstream upgrade plan live in [NEIRO Payment Network Core](https://github.com/bropump/neiro-payment-network-core/blob/main/CONFIGURATION.md).
 
 ```sh
 curl https://YOUR-ROUTER/operators/register \
