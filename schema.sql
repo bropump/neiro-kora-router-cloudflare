@@ -20,3 +20,9 @@ CREATE TABLE IF NOT EXISTS regional_leases (
 CREATE TABLE IF NOT EXISTS operator_observations (
  operator_id TEXT PRIMARY KEY, config_json TEXT, sample_json TEXT
 );
+
+-- Observed official Kora server versions and their upgrade grace deadlines.
+CREATE TABLE IF NOT EXISTS kora_releases (
+ version TEXT PRIMARY KEY,
+ first_seen_at INTEGER NOT NULL
+);

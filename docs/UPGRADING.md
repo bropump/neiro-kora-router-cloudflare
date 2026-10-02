@@ -5,6 +5,7 @@ Back up the database first. Apply only migrations missing from your installation
 - `0002_multiple_endpoints_per_hostname.sql`: removes the old unique-hostname constraint.
 - `0003_regional_samples.sql`: adds regional sample measurements.
 - `0004_submission_timings.sql`: adds submission timing history.
+- `0005_kora_versions.sql`: adds daily Kora operator version checks. Apply before deploying this worker. Existing operators receive three days from the first observed release target.
 
 ```sh
 npx wrangler d1 execute neiro-kora-router --remote --file=migrations/MIGRATION.sql

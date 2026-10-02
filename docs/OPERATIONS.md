@@ -16,6 +16,16 @@ Samples are unsigned empty transactions, not representative transfer, swap or ac
 
 All JSON-RPC method names and batches are forwarded to one selected provider, with the original JSON body and upstream response text preserved. A batch cannot pin conflicting providers. Kora decides which methods and transaction formats it supports. The router no longer rejects a transaction merely for exceeding 1,232 bytes or being version 1; the inspected live Kora services report 2.2.0-beta.8, whose transaction support has not established version-1 acceptance. Actual Kora and Solana acceptance of version-1 transactions requires separate end-to-end verification. Router passthrough is not evidence of network support.
 
+### Daily operator version checks
+
+The router checks each registered Kora operator's `getVersion` at admission and then once every 24 hours through the existing minute scheduler. It also checks official `solana-foundation/kora` GitHub releases daily, selecting the highest server semantic version (`v...` tags, including prereleases); TypeScript SDK releases and drafts are excluded. Application clients and SDK versions are never checked.
+
+Operators receive three days from the router's first observation of a newer release. Once that deadline passes, older providers are excluded from every routing mode, including explicit pins. Healthy configuration checks cannot override this exclusion. Providers become eligible again after a daily check observes their upgrade, provided their other health/config checks pass. Versions newer than the published target also pass. Additional releases do not extend existing deadlines.
+
+`/operators` includes a `version` object with the reported version, latest target, check time, status and upgrade deadline (Unix milliseconds). Eligibility is recomputed against deadlines on each request. Reports can lag the scheduled check by the directory cache's existing maximum of two minutes, plus D1 replica lag.
+
+If GitHub is unavailable, the last known release requirements remain in force and the feed is retried hourly. Before the first successful feed lookup, version enforcement waits. A failed operator version check preserves its last successful report; three days without successful version verification excludes it until a later check succeeds. Operators with no valid report receive at most the applicable initial grace. No image/commit reporting is required: builds reporting the same Kora package version remain indistinguishable.
+
 ### Passive submission measurements
 
 Single `signAndSendTransaction` requests with an explicit `respond_after: "sent"` are timed through receipt of the complete upstream response. Successful acknowledgements must have HTTP success, a matching JSON-RPC ID and a signature-shaped result. Errors, timeouts and malformed acknowledgements count as sampled failures, not fast successes. Batches, notifications, omitted modes, `signed`, `confirmed` and sign-only calls are excluded; all still pass through unchanged. Stock Kora defaults the omitted mode to `confirmed`, so the router never assumes it means `sent` ([Kora v2.2.0-beta.8 source](https://github.com/solana-foundation/kora/blob/v2.2.0-beta.8/crates/lib/src/rpc_server/method/sign_and_send_transaction.rs)).
