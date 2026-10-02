@@ -8,7 +8,9 @@ Back up the database first. Apply only migrations missing from your installation
 
 ```sh
 npx wrangler d1 execute neiro-kora-router --remote --file=migrations/MIGRATION.sql
-npx wrangler deploy
+npm run deploy
 ```
 
 Fresh databases created with `schema.sql` already include these changes. Do not apply them again.
+
+The TypeScript upgrade uses the existing schema. Run `npm ci` to install its pinned development dependencies before deploying.

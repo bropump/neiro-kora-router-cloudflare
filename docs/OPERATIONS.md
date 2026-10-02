@@ -84,3 +84,9 @@ Enable D1 read replication in the database settings. Routing directory and obser
 ## Routing-state cleanup
 
 The minute cron deletes regional rows and shared observations whose newest quote/config measurement is older than 15 minutes, plus orphaned observations. Regional rows with retained submission history are the exception: they survive until that history expires after seven days; individual expired submission events are pruned independently even on active rows. Active regional failure backoff is preserved. Coordination records are deleted 15 minutes after their lease deadline. Each table deletes at most 500 rows per maintenance run, so a backlog drains over subsequent runs. Freshness limits for routing remain five minutes for health/latency and eleven minutes for sample costs; retention does not extend eligibility. Registered operators remain until removal or failed ownership verification. Directory maintenance is scheduled only; payment/list requests no longer acquire its D1 lease.
+
+## TypeScript development
+
+The router source is strict TypeScript, compiled by Wrangler. Run `npm run typecheck` and `npm run format:check` before deployment; `npm run deploy` also runs the type checker. GitHub Actions checks types, formatting and the Worker build on pull requests and main pushes. Cloudflare binding types and development tools are pinned in the lockfile. Network JSON still passes through the existing runtime checks, and forwarded transaction/response bytes remain unchanged.
+
+The TypeScript migration requires no database migration or operator changes.

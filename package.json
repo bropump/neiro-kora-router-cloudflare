@@ -3,10 +3,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "deploy": "wrangler deploy",
-    "db:apply": "wrangler d1 execute neiro-kora-router --remote --file=schema.sql"
+    "deploy": "npm run typecheck && wrangler deploy",
+    "db:apply": "wrangler d1 execute neiro-kora-router --remote --file=schema.sql",
+    "typecheck": "tsc --noEmit",
+    "format:check": "prettier --check \"src/**/*.ts\" tsconfig.json"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "5.20261002.1",
+    "prettier": "3.9.9",
+    "typescript": "7.0.2",
     "wrangler": "4.145.0"
   }
 }
