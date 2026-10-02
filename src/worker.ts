@@ -1,3 +1,9 @@
+import {
+  acknowledgedSignatures,
+  recordActivity,
+  activityFeed,
+  reconcileActivity,
+} from "./activity.js";
 import { dashboard, measurements } from "./dashboard.js";
 import { isRecord } from "./types.js";
 import type {
@@ -496,6 +502,11 @@ function regionalCandidates(rows: Operator[], region: string) {
 export default {
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil(scheduledRefresh(env));
+    ctx.waitUntil(
+      reconcileActivity(env).catch(() =>
+        console.error("activity_confirmation_failed"),
+      ),
+    );
   },
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -528,6 +539,19 @@ export default {
       ).success
     )
       return json({ error: "Request limit reached" }, 429);
+    if (url.pathname === "/network/activity" && request.method === "GET") {
+      const key = new Request(url.origin + "/_network-activity");
+      const cached = await caches.default.match(key);
+      if (cached) return cached;
+      try {
+        const response = json(await activityFeed(routingEnv()));
+        response.headers.set("cache-control", "public, max-age=30");
+        ctx.waitUntil(caches.default.put(key, response.clone()));
+        return response;
+      } catch {
+        return json({ error: "Activity unavailable" }, 503);
+      }
+    }
     if (url.pathname === "/dashboard" && request.method === "GET")
       return new Response(dashboard, {
         headers: {
@@ -740,6 +764,15 @@ export default {
         positiveSetting(env, "UPSTREAM_TIMEOUT_MS", 30000),
         positiveSetting(env, "MAX_RPC_RESPONSE_BYTES", 1048576),
       );
+      if (result.status >= 200 && result.status < 300) {
+        const signatures = acknowledgedSignatures(body, result.value);
+        if (signatures.length)
+          ctx.waitUntil(
+            recordActivity(env, chosen.id, signatures).catch(() =>
+              console.error("activity_record_failed"),
+            ),
+          );
+      }
       const responseValue = result.value as RpcEnvelope | undefined;
       if (submissionBody)
         ctx.waitUntil(

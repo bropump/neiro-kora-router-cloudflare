@@ -1,5 +1,6 @@
 /** Types for router-owned state. Network JSON remains untrusted at runtime. */
 export interface Settings {
+  ACTIVITY_RPC_URL?: string;
   ENROLLMENT_OPEN?: string;
   NEIRO_MINT: string;
   ROUTER_HOSTS?: string;
