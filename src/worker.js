@@ -4,6 +4,7 @@ import {inspect,ownership,upstream,forward} from './upstream.mjs';
 import {selectOperator,normalizePrice} from './selection.mjs';
 import {loadRegional,noteQuote,refreshRegional,localFailureUntil} from './regional.mjs';
 import {probeQuote,transactionPayer} from './probe.mjs';
+import {checkOperatorVersion,refreshVersions,versionStatus} from './versions.mjs';
 const hash=async s=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s)))].map(x=>x.toString(16).padStart(2,'0')).join('');
 async function budget(env,key,max){
  const now=Date.now();const result=await env.DB.prepare('INSERT INTO limits (id,n,reset) VALUES (?,1,?) ON CONFLICT(id) DO UPDATE SET n=CASE WHEN reset<=? THEN 1 ELSE n+1 END, reset=CASE WHEN reset<=? THEN ? ELSE reset END WHERE reset<=? OR n<? RETURNING n').bind(key,now+3600000,now,now,now+3600000,now,max).first();return !!result;
@@ -34,7 +35,7 @@ async function check(env,row,identityOnly=false,attempt){try{
  '$.identityBoundAt',COALESCE(json_extract(data,'$.identityBoundAt'),CASE WHEN json_extract(data,'$.payer') IS NOT NULL THEN created_at ELSE ? END),
  '$.payer',?,'$.paymentAddress',?,'$.latencyMs',?,'$.price',json(?)) WHERE id=? AND last_attempt=? AND checked_at<=? RETURNING status`)
  .bind(measured.checkedAt,measured.checkedAt,now,now,measured.payer,measured.paymentAddress,measured.latencyMs,JSON.stringify(measured.price??null),row.id,attempt,measured.checkedAt).first();
- if(updated)row.status='active';
+ if(updated){row.status='active';await checkOperatorVersion(env,row.id);}
  }catch(e){
  const now=Date.now(),status=row.status==='pending'?'pending':'disabled';
  const updated=await env.DB.prepare("UPDATE operators SET status=?,checked_at=?,data=json_set(data,'$.status',?,'$.healthy',json('false'),'$.checkedAt',?,'$.verifiedAt',?) WHERE id=? AND last_attempt=? RETURNING status").bind(status,now,status,now,now,row.id,attempt).first();
@@ -115,6 +116,7 @@ async function recordConfig(env,origin,row,event){
 const refresh=(rows,env,origin,region)=>refreshRegional(rows.filter(row=>['active','offline'].includes(row.status)),env,origin,region,row=>probeQuote(row,env.NEIRO_MINT),{onConfig:(row,event)=>recordConfig(env,origin,row,event)});
 async function scheduledRefresh(env){
  await maintainIfDue(env);
+ await refreshVersions(env);
  const origin='https://'+(env.ROUTER_HOSTS||'router.invalid').split(',')[0];
  const stored=await env.DB.prepare("SELECT data FROM operators WHERE status IN ('active','offline')").all();
  await refresh(stored.results.map(x=>JSON.parse(x.data)),env,origin,'SCHEDULED');
@@ -127,19 +129,20 @@ async function maintainIfDue(env){
 async function pool(env,ctx,origin){
  const key=new Request(origin+'/_pool'),refreshKey=new Request(origin+'/_pool-refresh');
  const configured=new Set(configuredOperators(env).map(row=>row.url));
- const fresh=rows=>rows.map(row=>({...row,configured:configured.has(row.url),healthy:row.status==='active'&&row.healthy===true&&row.checkedAt<=Date.now()&&row.checkedAt>Date.now()-300000}));
+ const fresh=value=>value.rows.map(row=>{const version=versionStatus(row,value.releases||[]);return {...row,version,configured:configured.has(row.url),healthy:version.eligible&&row.status==='active'&&row.healthy===true&&row.checkedAt<=Date.now()&&row.checkedAt>Date.now()-300000};});
  const hit=await caches.default.match(key),previous=hit?await hit.json():null;
  const age=previous?Date.now()-previous.at:Infinity;
  async function update(){
   const at=Date.now();
   const result=await env.DB.prepare("SELECT data FROM operators WHERE status!='pending' AND json_extract(data,'$.payer') IS NOT NULL").all();
-  const value={at,rows:result.results.map(r=>{const {token,...row}=JSON.parse(r.data);return row;})};
-  await caches.default.put(key,Response.json(value,{headers:{'cache-control':'max-age=120'}}));return value.rows;
+  const releases=await env.DB.prepare('SELECT version,first_seen_at FROM kora_releases').all();
+  const value={at,releases:releases.results,rows:result.results.map(r=>{const {token,...row}=JSON.parse(r.data);return row;})};
+  await caches.default.put(key,Response.json(value,{headers:{'cache-control':'max-age=120'}}));return value;
  }
- if(age>=0&&age<60000)return fresh(previous.rows);
+ if(age>=0&&age<60000)return fresh(previous);
  if(age>=60000&&age<120000){
   ctx.waitUntil((async()=>{if(await caches.default.match(refreshKey))return;await caches.default.put(refreshKey,new Response('1',{headers:{'cache-control':'max-age=5'}}));await update();})().catch(()=>{}));
-  return fresh(previous.rows);
+  return fresh(previous);
  }
  return fresh(await update());
 }
@@ -168,7 +171,7 @@ export default {async scheduled(controller,env,ctx){ctx.waitUntil(scheduledRefre
   try{const region=request.cf?.colo||'unknown',baseRows=await pool(routingEnv(),ctx,url.origin);
    ctx.waitUntil(refresh(baseRows,env,url.origin,region).catch(()=>{}));
    const rows=regionalCandidates(await loadRegional(baseRows,routingEnv(),url.origin,region,ctx),region);
-   return json({colo:region,operators:rows.map(r=>({id:r.id,payer:r.payer,eligible:!!r.healthy,latencyMs:r.latencyMs===1e9?null:r.latencyMs,price:normalizePrice(r.price),submissionStats:r.submissionStats,quoteEwmaMs:r.quoteStats?.region===region&&r.quoteStats.at<=Date.now()&&Date.now()-r.quoteStats.at<300000?r.quoteStats.ewmaMs:null,sampleEwmaMs:r.sampleStats?.region===region&&r.sampleStats.at<=Date.now()&&Date.now()-r.sampleStats.at<300000?r.sampleStats.ewmaMs:null,checkedAt:r.checkedAt,sampleQuote:r.sampleQuote?{...r.sampleQuote,stale:Date.now()-r.sampleQuote.at>660000}:null}))});
+   return json({colo:region,operators:rows.map(r=>({id:r.id,payer:r.payer,eligible:!!r.healthy,version:r.version,latencyMs:r.latencyMs===1e9?null:r.latencyMs,price:normalizePrice(r.price),submissionStats:r.submissionStats,quoteEwmaMs:r.quoteStats?.region===region&&r.quoteStats.at<=Date.now()&&Date.now()-r.quoteStats.at<300000?r.quoteStats.ewmaMs:null,sampleEwmaMs:r.sampleStats?.region===region&&r.sampleStats.at<=Date.now()&&Date.now()-r.sampleStats.at<300000?r.sampleStats.ewmaMs:null,checkedAt:r.checkedAt,sampleQuote:r.sampleQuote?{...r.sampleQuote,stale:Date.now()-r.sampleQuote.at>660000}:null}))});
   }catch{return json({error:'Directory unavailable'},503);}
  }
  if(url.pathname!=='/rpc')return json({error:'Not found'},404);
