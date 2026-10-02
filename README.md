@@ -23,7 +23,7 @@ Join by submitting your public HTTPS URL to `/operators/register`, hosting the r
 
 ## Deploy your own router
 
-Requires Cloudflare Workers Paid and D1. No Durable Objects or Solana RPC key.
+Requires Node.js 24, Cloudflare Workers Paid and D1. No Durable Objects or Solana RPC key.
 
 ```sh
 npm ci
@@ -35,7 +35,7 @@ Set the database ID, Worker name and `ROUTER_HOSTS` in `wrangler.jsonc`, then:
 
 ```sh
 npx wrangler d1 execute neiro-kora-router --remote --file=schema.sql
-npx wrangler deploy
+npm run deploy
 ```
 
 A new deployment needs an operator to register before it can route payments. Operator endpoints stay public; operators manage their own security and availability.

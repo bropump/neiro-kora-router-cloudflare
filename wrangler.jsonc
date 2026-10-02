@@ -1,6 +1,6 @@
 {
   "name": "neiro-kora-router",
-  "main": "src/worker.js",
+  "main": "src/worker.ts",
   "compatibility_date": "2026-10-01",
   "compatibility_flags": [
     "nodejs_compat"
