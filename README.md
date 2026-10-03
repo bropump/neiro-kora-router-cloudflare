@@ -15,7 +15,7 @@ Set your Kora client's endpoint to:
 
 Prepare the payment with the selected payer and keep that provider pinned through signing. The router never retries or moves a signed payment to another provider. Kora supplies the actual transaction quote; check the fee before signing. Sample prices and response times do not guarantee the cheapest final payment or fastest landing.
 
-`GET /operators` shows availability, prices and timings. `GET /healthz` checks the Worker. Responses include routing details in `x-neiro-routing`.
+`GET /operators` shows availability, prices, timings and operator-reported `hostingRegions`. Its `measurementColo` identifies the Cloudflare location used for regional measurements; `colo` remains a legacy alias for that field. Neither is the Kora hosting location. `GET /healthz` checks the Worker. Responses include routing details in `x-neiro-routing`.
 
 ## Run an operator
 
@@ -48,10 +48,14 @@ A new deployment needs an operator to register before it can route payments. Ope
 
 ### Operator hosting locations
 
-The dashboard shows operator hosting locations separately from Cloudflare measurement locations. To publish yours, add an optional `hostingRegions` list to your existing verification JSON, keeping its token and enabled flag:
+The dashboard shows operator hosting locations separately from Cloudflare measurement locations. An empty `hostingRegions` list means unknown; the router never fills it with the caller’s location, a Cloudflare edge location, or an IP-geolocation guess. To publish yours, add an optional `hostingRegions` list to your existing verification JSON, keeping its token and enabled flag:
 
 ```json
 {"token":"YOUR_EXISTING_TOKEN","enabled":true,"hostingRegions":["Frankfurt, Germany","Singapore","New York, USA"]}
 ```
 
 Use your actual hosting locations. These are operator-reported labels, not independently verified locations, and do not influence routing. One endpoint can list several regions. Call `/operators/verify` after updating the file; periodic ownership checks also pick up changes. Omit the field or use an empty list to clear it. Up to 16 labels of 80 characters each are supported. Deployment-configured operators use the same optional field in their `CONFIGURED_OPERATORS` entry. Kora configuration remains unchanged.
+
+### Location regression tests
+
+Run `npm test`, `npm run typecheck` and `npm run format:check`. The local tests exercise the `/operators` handler with Frankfurt hosting metadata and different Cloudflare measurement locations, including unreported and multiple hosting locations. They make no external requests.

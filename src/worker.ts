@@ -442,11 +442,17 @@ async function maintainIfDue(env: Env) {
 async function pool(env: ReadEnv, ctx: ExecutionContext, origin: string) {
   const key = new Request(origin + "/_pool"),
     refreshKey = new Request(origin + "/_pool-refresh");
-  const configured = new Set(configuredOperators(env).map((row) => row.url));
+  const configured = new Map(
+    configuredOperators(env).map((row) => [row.url, row]),
+  );
   const fresh = (rows: Operator[]) =>
     rows.map((row) => ({
       ...row,
       configured: configured.has(row.url),
+      // Apply current display metadata even when the pool snapshot predates it.
+      hostingRegions: configured.has(row.url)
+        ? configured.get(row.url)!.hostingRegions || []
+        : row.hostingRegions || [],
       healthy:
         row.status === "active" &&
         row.healthy === true &&
@@ -646,6 +652,8 @@ export default {
           region,
         );
         return json({
+          measurementColo: region,
+          // Legacy alias: this is the measurement origin, never an operator location.
           colo: region,
           operators: rows.map((r) => ({
             id: r.id,

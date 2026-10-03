@@ -6,7 +6,8 @@
     "deploy": "npm run typecheck && wrangler deploy",
     "db:apply": "wrangler d1 execute neiro-kora-router --remote --file=schema.sql",
     "typecheck": "tsc --noEmit",
-    "format:check": "prettier --check \"src/**/*.ts\" tsconfig.json"
+    "format:check": "prettier --check \"src/**/*.ts\" tsconfig.json",
+    "test": "node --import ./test/register.mjs --test test/*.test.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261002.1",
