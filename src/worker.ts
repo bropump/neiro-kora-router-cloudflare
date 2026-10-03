@@ -653,8 +653,6 @@ export default {
         );
         return json({
           measurementColo: region,
-          // Legacy alias: this is the measurement origin, never an operator location.
-          colo: region,
           operators: rows.map((r) => ({
             id: r.id,
             payer: r.payer,

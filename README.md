@@ -15,7 +15,7 @@ Set your Kora client's endpoint to:
 
 Prepare the payment with the selected payer and keep that provider pinned through signing. The router never retries or moves a signed payment to another provider. Kora supplies the actual transaction quote; check the fee before signing. Sample prices and response times do not guarantee the cheapest final payment or fastest landing.
 
-`GET /operators` shows availability, prices, timings and operator-reported `hostingRegions`. Its `measurementColo` identifies the Cloudflare location used for regional measurements; `colo` remains a legacy alias for that field. Neither is the Kora hosting location. `GET /healthz` checks the Worker. Responses include routing details in `x-neiro-routing`.
+`GET /operators` shows availability, prices, timings and operator-reported `hostingRegions`. Its `measurementColo` identifies the Cloudflare location used for regional measurements, not the Kora hosting location. Clients do not need this field to transact. `GET /healthz` checks the Worker. Responses include routing details in `x-neiro-routing`.
 
 ## Run an operator
 

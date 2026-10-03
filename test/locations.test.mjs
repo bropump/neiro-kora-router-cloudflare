@@ -100,11 +100,7 @@ for (const colo of ["CDG", "FRA", "SYD", undefined]) {
   test(`Kora hosting locations are preserved with measurement colo ${colo}`, async (t) => {
     const result = await directory(t, colo, hosting);
     assert.equal(result.measurementColo, colo ?? "unknown");
-    assert.equal(
-      result.colo,
-      result.measurementColo,
-      "legacy measurement alias remains compatible",
-    );
+    assert.equal(Object.hasOwn(result, "colo"), false);
     assert.deepEqual(result.operators[0].hostingRegions, hosting);
   });
 }
@@ -140,60 +136,57 @@ class Element {
   scrollIntoView() {}
 }
 
-for (const legacy of [false, true]) {
-  test(`dashboard separates host labels from measurement labels (${legacy ? "legacy" : "explicit"} API)`, async () => {
-    const elements = new Map();
-    const el = (id) => {
-      if (!elements.has(id)) elements.set(id, new Element());
-      return elements.get(id);
-    };
-    const operators = [hosting, []].map((hostingRegions, i) => ({
-      id: `operator-${i}`,
-      payer,
-      hostingRegions,
-      eligible: true,
-      sampleEwmaMs: 10,
-      price: { type: "free" },
-    }));
-    const data = { colo: legacy ? "CDG" : "FRA", operators };
-    if (!legacy) data.measurementColo = "CDG";
-    const context = vm.createContext({
-      document: { getElementById: el, createElement: () => new Element() },
-      location: { origin: "https://router.example" },
-      setInterval() {},
-      fetch: async (path) => {
-        if (path === "/operators") return Response.json(data);
-        if (path === "/network/measurements")
-          return Response.json({ measurements: [], truncated: false });
-        if (path === "/network/activity")
-          return Response.json({
-            counts: [],
-            recent: [],
-            startedAt: Date.now(),
-          });
-        assert.fail("Unexpected request: " + path);
-      },
-    });
-    const script = dashboard.match(/<script>([\s\S]*)<\/script>/)[1];
-    vm.runInContext(script, context);
-    await vm.runInContext("refresh()", context);
-    assert.match(el("status").textContent, /^Updated /);
-    assert.equal(
-      el("operators").children[0].children[1].textContent,
-      hosting.join(" · "),
-    );
-    assert.equal(
-      el("operators").children[1].children[1].textContent,
-      "Unknown — operator has not reported a location",
-    );
-    assert.equal(
-      el("colo").textContent,
-      "Latency measured from Cloudflare: CDG (not the Kora hosting location)",
-    );
-    assert.ok(
-      !el("operators").children.some((row) =>
-        row.children[1].textContent.includes("CDG"),
-      ),
-    );
+test("dashboard separates host labels from measurement labels without a colo alias", async () => {
+  const elements = new Map();
+  const el = (id) => {
+    if (!elements.has(id)) elements.set(id, new Element());
+    return elements.get(id);
+  };
+  const operators = [hosting, []].map((hostingRegions, i) => ({
+    id: `operator-${i}`,
+    payer,
+    hostingRegions,
+    eligible: true,
+    sampleEwmaMs: 10,
+    price: { type: "free" },
+  }));
+  const data = { measurementColo: "CDG", operators };
+  const context = vm.createContext({
+    document: { getElementById: el, createElement: () => new Element() },
+    location: { origin: "https://router.example" },
+    setInterval() {},
+    fetch: async (path) => {
+      if (path === "/operators") return Response.json(data);
+      if (path === "/network/measurements")
+        return Response.json({ measurements: [], truncated: false });
+      if (path === "/network/activity")
+        return Response.json({
+          counts: [],
+          recent: [],
+          startedAt: Date.now(),
+        });
+      assert.fail("Unexpected request: " + path);
+    },
   });
-}
+  const script = dashboard.match(/<script>([\s\S]*)<\/script>/)[1];
+  vm.runInContext(script, context);
+  await vm.runInContext("refresh()", context);
+  assert.match(el("status").textContent, /^Updated /);
+  assert.equal(
+    el("operators").children[0].children[1].textContent,
+    hosting.join(" · "),
+  );
+  assert.equal(
+    el("operators").children[1].children[1].textContent,
+    "Unknown — operator has not reported a location",
+  );
+  assert.equal(
+    el("colo").textContent,
+    "Latency measured from Cloudflare: CDG (not the Kora hosting location)",
+  );
+  assert.ok(
+    !el("operators").children.some((row) =>
+      row.children[1].textContent.includes("CDG"),
+    ),
+  );
+});
