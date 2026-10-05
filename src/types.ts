@@ -1,5 +1,6 @@
 /** Types for router-owned state. Network JSON remains untrusted at runtime. */
 export interface Settings {
+  FUNDING_RPC_URL?: string;
   ACTIVITY_RPC_URL?: string;
   ENROLLMENT_OPEN?: string;
   NEIRO_MINT: string;
@@ -9,6 +10,9 @@ export interface Settings {
   MAINTENANCE_BATCH_SIZE?: string;
   CONFIG_CHECK_CONCURRENCY?: string;
   REGIONAL_CONFIG_BATCH_SIZE?: string;
+  REGIONAL_PROBE_INTERVAL_MS?: string;
+  ACTIVITY_RETENTION_DAYS?: string;
+  ACTIVITY_CHECK_BATCHES?: string;
   MAX_RPC_BODY_BYTES?: string;
   MAX_RPC_RESPONSE_BYTES?: string;
   UPSTREAM_TIMEOUT_MS?: string;
@@ -21,7 +25,7 @@ export interface ReadEnv extends Settings {
   DB: Pick<D1Database, "prepare">;
 }
 export type OperatorStatus =
-  "pending" | "active" | "offline" | "disabled" | "removed";
+  "pending" | "active" | "offline" | "disabled" | "archived" | "removed";
 export interface Registration {
   hostingRegions?: string[];
   id: string;
@@ -31,6 +35,13 @@ export interface Registration {
   createdAt: number;
   checkedAt: number;
   verifiedAt?: number;
+  lastSuccessfulAt?: number;
+  offlineSince?: number;
+  failureReason?: string | null;
+  failures?: number;
+  nextCheckAt?: number;
+  archivedAt?: number;
+  funding?: import("./readiness.js").Funding;
   identityBoundAt?: number;
   payer?: string;
   paymentAddress?: string;

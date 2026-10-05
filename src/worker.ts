@@ -43,6 +43,19 @@ import {
   localFailureUntil,
 } from "./regional.js";
 import { probeQuote, transactionPayer } from "./probe.js";
+import {
+  checkFunding,
+  fundingExclusion,
+  fundingScope,
+  refreshFunding,
+} from "./readiness.js";
+import {
+  lifecycleFailure,
+  ownershipFresh,
+  publicOperators,
+  ARCHIVE_AFTER_MS,
+  boundedSetting,
+} from "./lifecycle.js";
 const hash = async (s: string) =>
   [
     ...new Uint8Array(
@@ -87,6 +100,7 @@ async function check(
   identityOnly = false,
   attempt: number,
 ) {
+  let failureReason = "ownership-proof-unavailable-or-invalid";
   try {
     const configured = configuredOperators(env).find((x) => x.url === row.url);
     if (!configured && !(await ownership(row))) {
@@ -94,6 +108,7 @@ async function check(
       row.status = "removed";
       return;
     }
+    failureReason = "kora-identity-or-config-invalid";
     if (configured) row.hostingRegions = configured.hostingRegions || [];
     if (
       identityOnly &&
@@ -136,11 +151,31 @@ async function check(
     )
       throw Error("Operator identity changed; remove and re-register");
     const now = Date.now();
+    failureReason = "funding-check-failed";
+    const [funding] = await checkFunding(env, [{ ...row, ...measured }]);
+    // Periodic account refresh may finish while admission is waiting on RPC.
+    // Preserve newer evidence and evaluate that retained state before activation.
+    const retained = await env.DB.prepare(
+      "UPDATE operators SET data=json_set(data,'$.funding',CASE WHEN COALESCE(json_extract(data,'$.funding.at'),0)>? THEN json_extract(data,'$.funding') ELSE json(?) END) WHERE id=? AND last_attempt=? RETURNING data",
+    )
+      .bind(funding.at, JSON.stringify(funding), row.id, attempt)
+      .first<StoredOperator>();
+    if (!retained) return;
+    const current = JSON.parse(retained.data) as Operator;
+    const fundingFailure = fundingExclusion(
+      { ...current, ...measured },
+      await fundingScope(env),
+    );
+    if (fundingFailure) {
+      failureReason = fundingFailure;
+      throw Error(fundingFailure);
+    }
     const updated = await env.DB.prepare(
       `UPDATE operators SET status='active',checked_at=?,data=json_set(data,
  '$.status','active','$.healthy',json('true'),'$.checkedAt',?,'$.verifiedAt',?,
  '$.identityBoundAt',COALESCE(json_extract(data,'$.identityBoundAt'),CASE WHEN json_extract(data,'$.payer') IS NOT NULL THEN created_at ELSE ? END),
- '$.payer',?,'$.paymentAddress',?,'$.latencyMs',?,'$.price',json(?),'$.hostingRegions',json(?)) WHERE id=? AND last_attempt=? AND checked_at<=? RETURNING status`,
+ '$.payer',?,'$.paymentAddress',?,'$.latencyMs',?,'$.price',json(?),'$.hostingRegions',json(?),
+ '$.lastSuccessfulAt',?,'$.offlineSince',NULL,'$.failureReason',NULL,'$.failures',0,'$.nextCheckAt',0,'$.archivedAt',NULL) WHERE id=? AND last_attempt=? AND checked_at<=? AND json_extract(data,'$.funding.at')=? RETURNING status`,
     )
       .bind(
         measured.checkedAt,
@@ -152,19 +187,22 @@ async function check(
         measured.latencyMs,
         JSON.stringify(measured.price ?? null),
         JSON.stringify(row.hostingRegions || []),
+        now,
         row.id,
         attempt,
         measured.checkedAt,
+        current.funding!.at,
       )
       .first<{ status: OperatorStatus }>();
     if (updated) row.status = "active";
   } catch (e) {
     const now = Date.now(),
       status = row.status === "pending" ? "pending" : "disabled";
+    const failure = lifecycleFailure(row, failureReason, now);
     const updated = await env.DB.prepare(
-      "UPDATE operators SET status=?,checked_at=?,data=json_set(data,'$.status',?,'$.healthy',json('false'),'$.checkedAt',?,'$.verifiedAt',?) WHERE id=? AND last_attempt=? RETURNING status",
+      "UPDATE operators SET status=?,checked_at=?,data=json_patch(json_set(data,'$.status',?,'$.healthy',json('false'),'$.checkedAt',?),json(?)) WHERE id=? AND last_attempt=? RETURNING status",
     )
-      .bind(status, now, status, now, now, row.id, attempt)
+      .bind(status, now, status, now, JSON.stringify(failure), row.id, attempt)
       .first<{ status: OperatorStatus }>();
     if (updated) row.status = status;
     throw e;
@@ -286,6 +324,8 @@ async function enroll(
         429,
       );
     const row = JSON.parse(stored.data) as Registration;
+    if (env.ENROLLMENT_OPEN !== "true" && row.status === "pending")
+      return json({ error: "Enrollment closed" }, 503);
     try {
       await check(env, row, false, now);
       return json({ id: row.id, status: row.status });
@@ -312,7 +352,7 @@ export async function pruneRoutingState(env: Env, now = Date.now()) {
    WHERE rowid IN (SELECT rowid FROM regional_stats WHERE json_extract(submission_json,'$[0].at')<=? LIMIT 500)`,
     ).bind(now - SUBMISSION_MAX_AGE_MS, now - SUBMISSION_MAX_AGE_MS),
     env.DB.prepare(
-      `DELETE FROM regional_stats WHERE rowid IN (SELECT rowid FROM regional_stats WHERE failed_until<=? AND (operator_id NOT IN (SELECT id FROM operators) OR MAX(COALESCE(json_extract(config_json,'$.at'),0),COALESCE(json_extract(quote_json,'$.at'),0),COALESCE(json_extract(sample_json,'$.at'),0))<? AND COALESCE(json_extract(submission_json,'$[#-1].at'),0)<=?) LIMIT 500)`,
+      `DELETE FROM regional_stats WHERE rowid IN (SELECT rowid FROM regional_stats WHERE failed_until<=? AND (operator_id NOT IN (SELECT id FROM operators WHERE status!='archived') OR last_probe_at=0 AND MAX(COALESCE(json_extract(config_json,'$.at'),0),COALESCE(json_extract(quote_json,'$.at'),0),COALESCE(json_extract(sample_json,'$.at'),0))<? AND COALESCE(json_extract(submission_json,'$[#-1].at'),0)<=?) LIMIT 500)`,
     ).bind(now, cutoff, now - SUBMISSION_MAX_AGE_MS),
     env.DB.prepare(
       `DELETE FROM operator_observations WHERE rowid IN (SELECT rowid FROM operator_observations WHERE operator_id NOT IN (SELECT id FROM operators) OR MAX(COALESCE(json_extract(config_json,'$.at'),0),COALESCE(json_extract(sample_json,'$.at'),0))<? LIMIT 500)`,
@@ -325,6 +365,12 @@ export async function pruneRoutingState(env: Env, now = Date.now()) {
 async function maintain(env: Env) {
   const now = Date.now();
   await pruneRoutingState(env, now);
+  // Retain the identity binding; retirement must not let another URL take it over.
+  await env.DB.prepare(
+    "UPDATE operators SET status='archived',data=json_set(data,'$.status','archived','$.healthy',json('false'),'$.archivedAt',?) WHERE id IN (SELECT id FROM operators WHERE status IN ('offline','disabled') AND json_extract(data,'$.offlineSince')>0 AND json_extract(data,'$.offlineSince')<=? ORDER BY json_extract(data,'$.offlineSince'),id LIMIT 100)",
+  )
+    .bind(now, now - ARCHIVE_AFTER_MS)
+    .run();
   // Deployment-owned public endpoints are trusted admission configuration, not
   // a flag accepted through registration. Identity is rechecked on every refresh.
   for (const entry of configuredOperators(env)) {
@@ -359,9 +405,13 @@ async function maintain(env: Env) {
     env.DB.prepare("DELETE FROM limits WHERE reset<?").bind(now),
   ]);
   const rows = await env.DB.prepare(
-    "SELECT id FROM operators WHERE status!='pending' AND COALESCE(json_extract(data,'$.verifiedAt'),0)<? ORDER BY COALESCE(json_extract(data,'$.verifiedAt'),0),id LIMIT ?",
+    "SELECT id FROM operators WHERE status NOT IN ('pending','archived') AND COALESCE(json_extract(data,'$.nextCheckAt'),0)<=? AND (COALESCE(json_extract(data,'$.verifiedAt'),0)<? OR status='disabled') ORDER BY last_attempt,id LIMIT ?",
   )
-    .bind(now - 600000, positiveSetting(env, "MAINTENANCE_BATCH_SIZE", 100))
+    .bind(
+      now,
+      now - 600000,
+      boundedSetting(env, "MAINTENANCE_BATCH_SIZE", 10, 25),
+    )
     .all<{ id: string }>();
   for (let i = 0; i < rows.results.length; i += 4)
     await Promise.all(
@@ -376,36 +426,57 @@ async function maintain(env: Env) {
       }),
     );
 }
-async function recordConfig(
+export async function recordConfig(
   env: Env,
   origin: string,
   row: Operator,
   event: ConfigEvent,
 ) {
-  const status = event.ok ? "active" : "offline";
+  const current = await env.DB.prepare("SELECT data FROM operators WHERE id=?")
+    .bind(row.id)
+    .first<StoredOperator>();
+  if (!current) return;
+  row = JSON.parse(current.data) as Operator;
+  const exclusion = event.ok
+    ? fundingExclusion(row, await fundingScope(env)) ||
+      (!ownershipFresh(row) ? "ownership-check-expired" : null)
+    : "kora-config-unavailable";
+  const ready = event.ok && !exclusion;
+  const status = ready ? "active" : "offline";
   // Atomic predicate prevents a concurrent identity/ownership rejection from
   // being overwritten by a configuration-only health success.
   await env.DB.prepare(
     `UPDATE operators SET status=?,checked_at=?,data=json_set(data,
  '$.status',?,'$.healthy',json(?),'$.checkedAt',?,'$.price',
- CASE WHEN ? THEN json(?) ELSE json_extract(data,'$.price') END)
- WHERE id=? AND status IN ('active','offline')`,
+ CASE WHEN ? THEN json(?) ELSE json_extract(data,'$.price') END,
+ '$.lastSuccessfulAt',CASE WHEN ? THEN ? ELSE json_extract(data,'$.lastSuccessfulAt') END,
+ '$.offlineSince',CASE WHEN ? THEN NULL ELSE COALESCE(json_extract(data,'$.offlineSince'),?) END,
+ '$.failureReason',?)
+ WHERE id=? AND status IN ('active','offline') AND checked_at<=? AND COALESCE(json_extract(data,'$.verifiedAt'),0)=? AND COALESCE(json_extract(data,'$.funding.at'),0)=?`,
   )
     .bind(
       status,
       event.at,
       status,
-      event.ok ? "true" : "false",
+      ready ? "true" : "false",
       event.at,
       event.ok ? 1 : 0,
       JSON.stringify(
         (event.ok ? event.config.validation_config?.price : null) ?? null,
       ),
+      ready ? 1 : 0,
+      event.at,
+      ready ? 1 : 0,
+      event.at,
+      exclusion,
       row.id,
+      event.at,
+      row.verifiedAt || 0,
+      row.funding?.at || 0,
     )
     .run();
   // Successful refreshes do not evict the local routing snapshot.
-  if (!event.ok) await caches.default.delete(new Request(origin + "/_pool"));
+  if (!ready) await caches.default.delete(new Request(origin + "/_pool-v2"));
 }
 const refresh = (rows: Operator[], env: Env, origin: string, region: string) =>
   refreshRegional(
@@ -440,8 +511,8 @@ async function maintainIfDue(env: Env) {
   if (lease) await maintain(env);
 }
 async function pool(env: ReadEnv, ctx: ExecutionContext, origin: string) {
-  const key = new Request(origin + "/_pool"),
-    refreshKey = new Request(origin + "/_pool-refresh");
+  const key = new Request(origin + "/_pool-v2"),
+    refreshKey = new Request(origin + "/_pool-refresh-v2");
   const configured = new Map(
     configuredOperators(env).map((row) => [row.url, row]),
   );
@@ -456,6 +527,7 @@ async function pool(env: ReadEnv, ctx: ExecutionContext, origin: string) {
       healthy:
         row.status === "active" &&
         row.healthy === true &&
+        ownershipFresh(row) &&
         row.checkedAt <= Date.now() &&
         row.checkedAt > Date.now() - 300000,
     }));
@@ -496,7 +568,7 @@ async function pool(env: ReadEnv, ctx: ExecutionContext, origin: string) {
   }
   return fresh(await update());
 }
-function regionalCandidates(rows: Operator[], region: string) {
+function regionalCandidates(rows: Operator[], region: string, scope: string) {
   const now = Date.now();
   return rows.map((row) => {
     const c = row.configStats,
@@ -507,7 +579,21 @@ function regionalCandidates(rows: Operator[], region: string) {
         now - c.at < 300000;
     return {
       ...row,
-      healthy: row.healthy && row.failedUntil! <= now && !(fresh && c.failed),
+      healthy:
+        row.healthy &&
+        ownershipFresh(row, now) &&
+        !fundingExclusion(row, scope, now) &&
+        row.failedUntil! <= now &&
+        !(fresh && c.failed),
+      failureReason:
+        row.status === "archived"
+          ? "archived-after-prolonged-outage"
+          : !ownershipFresh(row, now)
+            ? "ownership-check-expired"
+            : fundingExclusion(row, scope, now) ||
+              (fresh && c.failed
+                ? "local-config-check-failed"
+                : row.failureReason),
       latencyMs:
         fresh &&
         typeof c.latencyMs === "number" &&
@@ -521,6 +607,9 @@ function regionalCandidates(rows: Operator[], region: string) {
 }
 export default {
   async scheduled(_controller, env, ctx) {
+    ctx.waitUntil(
+      refreshFunding(env).catch(() => console.error("funding_refresh_failed")),
+    );
     ctx.waitUntil(scheduledRefresh(env));
     ctx.waitUntil(
       reconcileActivity(env).catch((error: unknown) => {
@@ -612,7 +701,7 @@ export default {
       ].includes(url.pathname)
     ) {
       if (
-        url.pathname !== "/operators/remove" &&
+        url.pathname === "/operators/register" &&
         env.ENROLLMENT_OPEN !== "true"
       )
         return json({ error: "Enrollment closed" }, 503);
@@ -631,7 +720,7 @@ export default {
         );
         if (url.pathname !== "/operators/register")
           await Promise.all(
-            ["/_pool", "/_pool-refresh"].map((path) =>
+            ["/_pool-v2", "/_pool-refresh-v2"].map((path) =>
               caches.default.delete(new Request(url.origin + path)),
             ),
           );
@@ -650,14 +739,25 @@ export default {
         const rows = regionalCandidates(
           await loadRegional(baseRows, routingEnv(), url.origin, region, ctx),
           region,
+          await fundingScope(env),
         );
         return json({
           measurementColo: region,
-          operators: rows.map((r) => ({
+          operators: publicOperators(
+            rows,
+            url.searchParams.get("includeInactive") === "true",
+          ).map((r) => ({
             id: r.id,
             payer: r.payer,
             hostingRegions: r.hostingRegions || [],
             eligible: !!r.healthy,
+            status: r.status,
+            lastSuccessfulAt: r.lastSuccessfulAt ?? null,
+            offlineSince: r.offlineSince ?? null,
+            failureReason: r.healthy
+              ? null
+              : (r.failureReason ?? "health-stale-or-unavailable"),
+            archivedAt: r.archivedAt ?? null,
             latencyMs: r.latencyMs === 1e9 ? null : r.latencyMs,
             price: normalizePrice(r.price),
             submissionStats: r.submissionStats,
@@ -718,6 +818,7 @@ export default {
       const rows = regionalCandidates(
         await loadRegional(baseRows, routingEnv(), url.origin, region, ctx),
         region,
+        await fundingScope(env),
       );
       const queryPayer = url.searchParams.get("provider") || undefined,
         operatorId = url.searchParams.get("operator") || undefined;

@@ -2,9 +2,7 @@
   "name": "neiro-kora-router",
   "main": "src/worker.ts",
   "compatibility_date": "2026-10-01",
-  "compatibility_flags": [
-    "nodejs_compat"
-  ],
+  "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "ratelimits": [
     {
@@ -12,39 +10,41 @@
       "namespace_id": "1021",
       "simple": {
         "limit": 50,
-        "period": 10
-      }
-    }
+        "period": 10,
+      },
+    },
   ],
   "vars": {
-    "ENROLLMENT_OPEN": "true",
+    "ENROLLMENT_OPEN": "false",
     "NEIRO_MINT": "CTg3ZgYx79zrE1MteDVkmkcGniiFrK1hJ6yiabropump",
     "ROUTER_HOSTS": "neiro-kora-router.YOUR-SUBDOMAIN.workers.dev",
     "ADMISSION_REQUESTS_PER_IP_HOUR": "60",
-    "MAINTENANCE_BATCH_SIZE": "100",
-    "CONFIG_CHECK_CONCURRENCY": "6",
+    "MAINTENANCE_BATCH_SIZE": "10",
+    "CONFIG_CHECK_CONCURRENCY": "2",
+    "REGIONAL_CONFIG_BATCH_SIZE": "12",
+    "REGIONAL_PROBE_INTERVAL_MS": "180000",
+    "ACTIVITY_RETENTION_DAYS": "7",
+    "ACTIVITY_CHECK_BATCHES": "4",
     "MAX_RPC_BODY_BYTES": "1048576",
     "MAX_RPC_RESPONSE_BYTES": "1048576",
-    "UPSTREAM_TIMEOUT_MS": "30000"
+    "UPSTREAM_TIMEOUT_MS": "30000",
   },
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 0.1
+    "head_sampling_rate": 0.1,
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "neiro-kora-router",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
-    }
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+    },
   ],
   "triggers": {
-    "crons": [
-      "* * * * *"
-    ]
+    "crons": ["* * * * *"],
   },
   "preview_urls": false,
   "limits": {
-    "cpu_ms": 30000
-  }
+    "cpu_ms": 30000,
+  },
 }
