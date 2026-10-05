@@ -1,6 +1,7 @@
 import type { Env, ReadEnv } from "./types.js";
 import { isRecord } from "./types.js";
 import { bounded } from "./policy.js";
+import { boundedSetting } from "./lifecycle.js";
 
 // Only acknowledged send operations are countable. Sign-only responses,
 // notifications, ambiguous batch IDs, transport failures and RPC errors are not.
@@ -11,6 +12,17 @@ export function acknowledgedSignatures(
   const requests = Array.isArray(request) ? request : [request];
   const responses = Array.isArray(response) ? response : [response];
   const out = new Set<string>();
+  const requestCounts = new Map<unknown, number>(),
+    responseById = new Map<unknown, unknown[]>();
+  for (const q of requests)
+    if (isRecord(q))
+      requestCounts.set(q.id, (requestCounts.get(q.id) || 0) + 1);
+  for (const r of responses)
+    if (isRecord(r)) {
+      const list = responseById.get(r.id) || [];
+      list.push(r);
+      responseById.set(r.id, list);
+    }
   for (const q of requests) {
     if (
       !isRecord(q) ||
@@ -22,12 +34,11 @@ export function acknowledgedSignatures(
       )
     )
       continue;
-    if (requests.filter((x) => isRecord(x) && x.id === q.id).length !== 1)
-      continue;
+    if (requestCounts.get(q.id) !== 1) continue;
     if (q.params !== undefined && !isRecord(q.params)) continue;
     const mode = isRecord(q.params) ? q.params.respond_after : undefined;
     if (mode !== undefined && mode !== "sent" && mode !== "confirmed") continue;
-    const matches = responses.filter((r) => isRecord(r) && r.id === q.id);
+    const matches = responseById.get(q.id) || [];
     if (matches.length !== 1) continue;
     const r = matches[0];
     if (
@@ -59,7 +70,7 @@ export async function recordActivity(
         .slice(i, i + 50)
         .map((signature) =>
           env.DB.prepare(
-            "INSERT OR IGNORE INTO network_transactions(signature,operator_id,submitted_at,next_check_at) VALUES (?,?,?,?)",
+            "INSERT OR IGNORE INTO network_transactions(signature,operator_id,submitted_at,next_check_at) SELECT ?,?,?,? WHERE (SELECT COALESCE(SUM(count),0) FROM network_activity_counts)<100000",
           ).bind(signature, operator, now, now),
         ),
     );
@@ -69,9 +80,10 @@ export async function activityFeed(env: ReadEnv) {
     env.DB.prepare(
       "SELECT started_at FROM network_activity_meta WHERE id=1",
     ).first<{ started_at: number }>(),
-    env.DB.prepare(
-      "SELECT status,COUNT(*) AS count FROM network_transactions GROUP BY status",
-    ).all<{ status: string; count: number }>(),
+    env.DB.prepare("SELECT status,count FROM network_activity_counts").all<{
+      status: string;
+      count: number;
+    }>(),
     env.DB.prepare(
       "SELECT signature,operator_id AS operatorId,submitted_at AS submittedAt,status,checked_at AS checkedAt,slot FROM network_transactions ORDER BY submitted_at DESC,signature LIMIT 50",
     ).all(),
@@ -80,6 +92,10 @@ export async function activityFeed(env: ReadEnv) {
     startedAt: meta?.started_at ?? null,
     counts: counts.results,
     recent: recent.results,
+    retentionDays: boundedSetting(env, "ACTIVITY_RETENTION_DAYS", 7, 30),
+    capacity: 100000,
+    trackingSaturated:
+      (counts.results || []).reduce((sum, x) => sum + x.count, 0) >= 100000,
   };
 }
 export async function signatureStatuses(
@@ -133,7 +149,7 @@ export function chainState(
     slot: Number(value.slot),
   };
 }
-export async function reconcileActivity(env: Env) {
+async function reconcileBatch(env: Env) {
   const now = Date.now();
   const rows = (
     await env.DB.prepare(
@@ -142,28 +158,64 @@ export async function reconcileActivity(env: Env) {
       .bind(now)
       .all<{ signature: string; submitted_at: number }>()
   ).results;
-  if (!rows.length) return;
+  if (!rows.length) return false;
   // Lease this bounded batch before calling RPC; overlapping cron invocations do not
   // change terminal statuses. A failed RPC leaves records pending for a later retry.
-  await env.DB.batch(
-    rows.map((r) =>
-      env.DB.prepare(
-        "UPDATE network_transactions SET next_check_at=? WHERE signature=?",
-      ).bind(now + 60000, r.signature),
-    ),
-  );
+  await env.DB.prepare(
+    "UPDATE network_transactions SET next_check_at=? WHERE signature IN (SELECT value FROM json_each(?))",
+  )
+    .bind(now + 60000, JSON.stringify(rows.map((r) => r.signature)))
+    .run();
   const statuses = await signatureStatuses(
     rows.map((r) => r.signature),
     env.ACTIVITY_RPC_URL || "https://api.mainnet-beta.solana.com",
   );
-  await env.DB.batch(
-    rows.map((r, i) => {
-      const chain = chainState(statuses[i]);
-      const status =
-        chain?.status || (now - r.submitted_at > 86400000 ? "unknown" : null);
-      return env.DB.prepare(
-        "UPDATE network_transactions SET status=COALESCE(?,status),slot=COALESCE(?,slot),checked_at=? WHERE signature=? AND status IN ('submitted','confirmed')",
-      ).bind(status, chain?.slot ?? null, now, r.signature);
-    }),
-  );
+  const updates = rows.map((r, i) => {
+    const chain = chainState(statuses[i]);
+    const status =
+      chain?.status || (now - r.submitted_at > 86400000 ? "unknown" : null);
+    return { signature: r.signature, status, slot: chain?.slot ?? null };
+  });
+  await env.DB.prepare(
+    `UPDATE network_transactions SET
+    status=COALESCE((SELECT json_extract(value,'$.status') FROM json_each(?) WHERE json_extract(value,'$.signature')=network_transactions.signature),status),
+    slot=COALESCE((SELECT json_extract(value,'$.slot') FROM json_each(?) WHERE json_extract(value,'$.signature')=network_transactions.signature),slot),checked_at=?
+    WHERE signature IN (SELECT json_extract(value,'$.signature') FROM json_each(?)) AND status IN ('submitted','confirmed')`,
+  )
+    .bind(
+      JSON.stringify(updates),
+      JSON.stringify(updates),
+      now,
+      JSON.stringify(updates),
+    )
+    .run();
+  return true;
+}
+export async function reconcileActivity(env: Env) {
+  const now = Date.now();
+  const lease = await env.DB.prepare(
+    "INSERT INTO regional_leases(id,n,reset) VALUES ('activity-reconcile',1,?) ON CONFLICT(id) DO UPDATE SET reset=excluded.reset WHERE regional_leases.reset<=? RETURNING id",
+  )
+    .bind(now + 60000, now)
+    .first();
+  if (!lease) return;
+  const cutoff =
+    now - boundedSetting(env, "ACTIVITY_RETENTION_DAYS", 7, 30) * 86400000;
+  await env.DB.prepare(
+    "DELETE FROM network_transactions WHERE signature IN (SELECT signature FROM network_transactions WHERE submitted_at<? ORDER BY submitted_at LIMIT 1000)",
+  )
+    .bind(cutoff)
+    .run();
+  // Also converge databases created before the cap was introduced. Keep each
+  // cleanup bounded even if historical telemetry contains millions of rows.
+  await env.DB.prepare(
+    "DELETE FROM network_transactions WHERE signature IN (SELECT signature FROM network_transactions ORDER BY submitted_at LIMIT MIN(1000,MAX(0,(SELECT COALESCE(SUM(count),0)-100000 FROM network_activity_counts))))",
+  ).run();
+  for (
+    let i = 0;
+    i < boundedSetting(env, "ACTIVITY_CHECK_BATCHES", 4, 8) &&
+    Date.now() - now < 40000;
+    i++
+  )
+    if (!(await reconcileBatch(env))) break;
 }

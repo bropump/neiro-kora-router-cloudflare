@@ -1,8 +1,11 @@
 import type { KoraConfig, KoraIdentity } from "./types.js";
+import { assertIsAddress } from "@solana/addresses";
 export const REQUIRED = [
   "get_config",
   "get_payer_signer",
   "estimate_transaction_fee",
+  "sign_transaction",
+  "sign_and_send_transaction",
 ];
 export function endpoint(raw: unknown, ownHosts: string[] = []) {
   if (typeof raw !== "string" || raw.length > 256 || raw.trim() !== raw)
@@ -74,6 +77,8 @@ export function configCheck(
       !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(identity[key])
     )
       throw Error("Invalid address");
+  assertIsAddress(identity.signer_address as string);
+  assertIsAddress(identity.payment_address as string);
   for (const m of REQUIRED)
     if (config.enabled_methods?.[m] !== true)
       throw Error("Kora methods unavailable");

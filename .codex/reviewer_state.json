@@ -1,0 +1,55 @@
+{
+  "entries": [
+    {
+      "timestamp": "2026-10-05T08:55:47.198369+00:00",
+      "scope": "Cloudflare readiness, stale-operator lifecycle and bounded background work",
+      "sources": [
+        "user request to fix critical review findings and stale inactive entry",
+        "prior CF controls/scale review",
+        "current diff and maintained tests"
+      ],
+      "tests": [
+        {
+          "cmd": "npm test",
+          "result": "pass",
+          "notes": "26 tests; fixture-only, no live signing or payments"
+        },
+        {
+          "cmd": "npm run typecheck",
+          "result": "pass"
+        },
+        {
+          "cmd": "npm run format:check",
+          "result": "pass"
+        },
+        {
+          "cmd": "git diff --check",
+          "result": "pass"
+        },
+        {
+          "cmd": "npx wrangler deploy --dry-run",
+          "result": "pass",
+          "notes": "183.10 KiB uncompressed / 46.13 KiB gzip"
+        },
+        {
+          "cmd": "independent legacy SQLite migration and counter checks",
+          "result": "pass"
+        },
+        {
+          "cmd": "read-only current CF directory, pinned getPayerSigner and Solana funding readiness",
+          "result": "pass",
+          "notes": "Bunny eligible; stale Mac tunnel remains in old live directory; no deployment performed"
+        }
+      ],
+      "findings": [
+        "Controls reviewer and scale reviewer: APPROVE WITH NOTES for bounded small-pool beta",
+        "26 tests include newer-funding concurrency guard, lifecycle/archive/reactivation, pins/no replay and work bounds",
+        "100/1000-entry fixtures establish bounded work and fairness, not continuous freshness/capacity",
+        "Endpoint ownership is HTTPS control; cryptographic payer authorization is not implemented; template enrollment closed",
+        "Existing directory/ranking reads scan pool; per-colo attempt metadata retained for fairness",
+        "Live rollout not performed; additive migration and readiness priming required"
+      ],
+      "verdict": "APPROVE WITH NOTES"
+    }
+  ]
+}

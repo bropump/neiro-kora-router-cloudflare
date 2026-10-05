@@ -3,6 +3,7 @@ import test from "node:test";
 import vm from "node:vm";
 import worker from "../src/worker.ts";
 import { dashboard } from "../src/dashboard.ts";
+import { fundingScope } from "../src/readiness.ts";
 
 const payer = "11111111111111111111111111111111";
 const url = "https://operator.example.com/";
@@ -24,6 +25,16 @@ async function directory(
     status: "active",
     healthy: true,
     checkedAt: now,
+    verifiedAt: now,
+    funding: {
+      at: now,
+      scope: await fundingScope({ NEIRO_MINT: payer }),
+      payer,
+      paymentAddress: payer,
+      lamports: 100000,
+      ready: true,
+      reason: null,
+    },
     hostingRegions,
     price: { type: "free" },
   };

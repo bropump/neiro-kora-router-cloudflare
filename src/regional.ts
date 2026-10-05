@@ -16,6 +16,7 @@ import type {
 import { summarizeSubmissions } from "./submission.js";
 import { configCheck } from "./policy.js";
 import { upstream } from "./upstream.js";
+import { boundedSetting } from "./lifecycle.js";
 
 // Measurements are scoped to the serving colo. Shared prices provide a cold
 // region fallback; payments never wait for background operator checks.
@@ -168,11 +169,11 @@ export function refreshOptions(env: Settings, count: number) {
   return {
     batch: integer(
       "REGIONAL_CONFIG_BATCH_SIZE",
-      Math.max(1, Math.min(count, 10000, Math.max(6, Math.ceil(count / 4)))),
+      Math.max(1, Math.min(count, 12)),
       1,
-      10000,
+      12,
     ),
-    concurrency: integer("CONFIG_CHECK_CONCURRENCY", 6, 1, 32),
+    concurrency: integer("CONFIG_CHECK_CONCURRENCY", 2, 1, 2),
   };
 }
 // INSERT/UPDATE admission is atomic across Worker isolates. Expired rows are
@@ -269,7 +270,13 @@ export async function refreshRegional(
   const now = Date.now(),
     key = cacheKey(origin, region, "refresh"),
     options = refreshOptions(env, rows.length);
-  const wakeMs = rows.length <= options.batch ? 60000 : 15000;
+  const wakeMs = 60000;
+  const interval = boundedSetting(
+    env,
+    "REGIONAL_PROBE_INTERVAL_MS",
+    180000,
+    240000,
+  );
   if (await cache()?.match(key)) return;
   await cache()?.put(
     key,
@@ -279,20 +286,23 @@ export async function refreshRegional(
   );
   if (!(await claim(env, `background:sweep:${region}`, 1, now, wakeMs))) return;
   const scheduled = region === "SCHEDULED",
-    deadline = now + (scheduled ? 240000 : 20000);
+    deadline = now + 20000;
   const local = await snapshot(env, region),
     byId = new Map(local.map((s) => [s.operator_id, s]));
-  const age = (row: Operator) =>
-    Math.min(
-      safeJSON<ConfigStats>(byId.get(row.id)?.config_json)?.at || 0,
-      safeJSON<Sample>(byId.get(row.id)?.sample_json)?.at || 0,
-    );
+  const age = (row: Operator) => byId.get(row.id)?.last_probe_at || 0;
   const selected = [...rows]
+    .filter((row) => now - age(row) >= interval)
     .sort((a, b) => age(a) - age(b) || a.id.localeCompare(b.id))
-    .slice(0, scheduled ? rows.length : options.batch);
+    .slice(0, options.batch);
   async function check(row: Operator) {
     const leaseKey = `config:regional:${region}:${row.id}`;
-    if (!(await claim(env, leaseKey, 1, Date.now(), 60000))) return;
+    if (!(await claim(env, leaseKey, 1, Date.now(), interval))) return;
+    // Persist attempts, including failures, so later invocations continue fairly.
+    await env.DB.prepare(
+      "INSERT INTO regional_stats(region,operator_id,last_probe_at) VALUES (?,?,?) ON CONFLICT(region,operator_id) DO UPDATE SET last_probe_at=excluded.last_probe_at",
+    )
+      .bind(region, row.id, Date.now())
+      .run();
     try {
       const response = await upstream<KoraConfig>(
         row.url,
@@ -384,7 +394,7 @@ export async function refreshRegional(
     )
       return;
     const leaseKey = `quote:regional:${region}:${row.id}`;
-    if (!(await claim(env, leaseKey, 1, Date.now(), 60000))) return;
+    if (!(await claim(env, leaseKey, 1, Date.now(), interval))) return;
     let result: ProbeResult;
     try {
       result = await probe(row);
@@ -442,14 +452,16 @@ export async function refreshRegional(
       await noteQuote(row, env, origin, region, result);
     }
   }
-  // Both stages run only under waitUntil/cron. Bounded parallelism and deadlines
-  // allow later batches to resume unfinished work without a huge polling burst.
+  // Finish each operator's config + quote together, so configs cannot starve quotes.
   for (
     let i = 0;
     i < selected.length && Date.now() < deadline;
     i += options.concurrency
   )
-    await Promise.all(selected.slice(i, i + options.concurrency).map(check));
-  for (let i = 0; i < selected.length && Date.now() < deadline; i += 2)
-    await Promise.all(selected.slice(i, i + 2).map(sample));
+    await Promise.all(
+      selected.slice(i, i + options.concurrency).map(async (row) => {
+        await check(row);
+        if (Date.now() < deadline) await sample(row);
+      }),
+    );
 }
