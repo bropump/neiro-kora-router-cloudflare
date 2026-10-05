@@ -476,7 +476,7 @@ export async function recordConfig(
     )
     .run();
   // Successful refreshes do not evict the local routing snapshot.
-  if (!ready) await caches.default.delete(new Request(origin + "/_pool"));
+  if (!ready) await caches.default.delete(new Request(origin + "/_pool-v2"));
 }
 const refresh = (rows: Operator[], env: Env, origin: string, region: string) =>
   refreshRegional(
@@ -511,8 +511,8 @@ async function maintainIfDue(env: Env) {
   if (lease) await maintain(env);
 }
 async function pool(env: ReadEnv, ctx: ExecutionContext, origin: string) {
-  const key = new Request(origin + "/_pool"),
-    refreshKey = new Request(origin + "/_pool-refresh");
+  const key = new Request(origin + "/_pool-v2"),
+    refreshKey = new Request(origin + "/_pool-refresh-v2");
   const configured = new Map(
     configuredOperators(env).map((row) => [row.url, row]),
   );
@@ -720,7 +720,7 @@ export default {
         );
         if (url.pathname !== "/operators/register")
           await Promise.all(
-            ["/_pool", "/_pool-refresh"].map((path) =>
+            ["/_pool-v2", "/_pool-refresh-v2"].map((path) =>
               caches.default.delete(new Request(url.origin + path)),
             ),
           );

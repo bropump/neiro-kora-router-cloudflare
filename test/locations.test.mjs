@@ -41,7 +41,7 @@ async function directory(
   const cache = new Map();
   if (cached)
     cache.set(
-      "https://router.example/_pool",
+      "https://router.example/_pool-v2",
       Response.json({ at: now, rows: [row] }),
     );
   t.mock.method(globalThis, "fetch", async () => {
