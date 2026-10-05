@@ -25,7 +25,7 @@ Follow the [operator setup guide](https://github.com/bropump/neiro-payment-netwo
 
 ## Deploy your own router
 
-Requires Node.js 24, Cloudflare Workers Paid, D1 and a trusted mainnet Solana RPC for readiness checks. The public RPC is the default; a production deployment should configure a reliable `FUNDING_RPC_URL`. No Durable Objects or operator signing keys are used.
+Requires Node.js 24, Cloudflare Workers Paid, D1 and a trusted mainnet Solana RPC for readiness checks. Readiness uses `FUNDING_RPC_URL`, then the existing `ACTIVITY_RPC_URL`, then the public RPC. Production should configure a reliable RPC; public RPC access can fail from Cloudflare. No Durable Objects or operator signing keys are used.
 
 ```sh
 npm ci

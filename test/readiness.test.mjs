@@ -126,3 +126,21 @@ test("payment operators must expose both supported signing paths", () => {
     /methods unavailable/,
   );
 });
+
+ test("readiness reuses activity RPC unless a dedicated funding RPC is set", async (t) => {
+  for (const dedicated of [false, true]) {
+    const env = { NEIRO_MINT: mint, ACTIVITY_RPC_URL: "https://activity.example.com", ...(dedicated ? { FUNDING_RPC_URL: "https://funding.example.com" } : {}) };
+    const row = await fixture(env);
+    const expected = dedicated ? env.FUNDING_RPC_URL : env.ACTIVITY_RPC_URL;
+    t.mock.method(globalThis, "fetch", async (url, options) => {
+      assert.equal(url, expected);
+      const q = JSON.parse(options.body);
+      const result = q.method === "getGenesisHash" ? MAINNET_GENESIS : q.method === "getMinimumBalanceForRentExemption" ? 1488440 : { context: { slot: 101 }, value: accounts() };
+      return Response.json({ jsonrpc: "2.0", id: 1, result });
+    });
+    const [state] = await checkFunding(env, [row]);
+    assert.equal(state.ready, true);
+    assert.equal(state.scope, await fundingScope({ NEIRO_MINT: mint, FUNDING_RPC_URL: expected }));
+    t.mock.restoreAll();
+  }
+});

@@ -23,7 +23,9 @@ export interface Funding {
   reason: string | null;
 }
 const endpoint = (env: Settings) =>
-  env.FUNDING_RPC_URL || "https://api.mainnet-beta.solana.com";
+  env.FUNDING_RPC_URL ||
+  env.ACTIVITY_RPC_URL ||
+  "https://api.mainnet-beta.solana.com";
 export async function fundingScope(env: Settings) {
   const digest = await crypto.subtle.digest(
     "SHA-256",
