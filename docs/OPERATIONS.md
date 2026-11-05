@@ -44,6 +44,8 @@ another available operator; already-forwarded requests are never replayed.
 - Per-IP ingress: 50 requests / 10 seconds (Workers local rate limiting, not global quota).
 - Request/response body: 1 MiB; upstream timeout: 30 seconds; no retries.
 - Local routing caches: 60 seconds fresh, up to 120 seconds while refreshing.
+  Empty regional snapshots refresh after five seconds; completed local probes evict
+  their regional snapshot immediately.
 - Config/latency eligibility: five minutes; discovery evidence: 15 minutes.
 - Funding: up to 50 oldest operators per minute, batches of 25; three-minute freshness.
 - Discovery RPC response: 8 MiB; eight-second request timeout; signed anchors deduplicated.

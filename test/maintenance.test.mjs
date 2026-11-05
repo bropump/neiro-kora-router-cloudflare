@@ -63,3 +63,11 @@ test("config event does not reject newer funding/ownership evidence as future", 
   assert.equal(current.status, "active");
   assert.equal(current.failureReason, null);
 });
+
+test("completed regional probes evict the cold snapshot immediately",async(t)=>{
+ const cache=cacheFixture(t),DB=database(),env={DB,NEIRO_MINT:mint};t.after(()=>DB.sql.close());const row=await fixture(env);insert(DB,row);
+ const key='https://router.example/_regional/CDG/stats';cache.set(key,Response.json({at:Date.now(),rows:[]}));
+ t.mock.method(globalThis,'fetch',async()=>Response.json({jsonrpc:'2.0',id:1,result:config}));
+ await refreshRegional([row],env,'https://router.example','CDG',async()=>({ok:true,ms:8,feeInToken:0,feeInLamports:0}));
+ assert.equal(cache.has(key),false);assert.equal(JSON.parse(DB.sql.prepare("SELECT sample_json FROM regional_stats WHERE region='CDG'").get().sample_json).ewmaMs,8);
+});

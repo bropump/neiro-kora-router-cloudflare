@@ -71,7 +71,8 @@ async function cachedRead<T>(
     hit = await cache()?.match(key);
   const previous = hit ? await hit.json<CachedRows<T>>() : null,
     now = Date.now();
-  if (previous && now >= previous.at && now - previous.at < 60000)
+  const freshFor = previous?.rows.length ? 60000 : 5000;
+  if (previous && now >= previous.at && now - previous.at < freshFor)
     return previous.rows;
   async function update() {
     const rows = await read();
@@ -467,4 +468,6 @@ export async function refreshRegional(
         if (Date.now() < deadline) await sample(row);
       }),
     );
+  // Publish newly measured latency locally without waiting for the snapshot TTL.
+  if (selected.length) await cache()?.delete(cacheKey(origin, region, "stats"));
 }
