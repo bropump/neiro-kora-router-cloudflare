@@ -3,13 +3,6 @@ import test from "node:test";
 import worker from "../src/worker.ts";
 import { selectOperator } from "../src/selection.ts";
 import {
-  ownershipFresh,
-  lifecycleFailure,
-  shouldArchive,
-  ARCHIVE_AFTER_MS,
-  OWNERSHIP_MAX_AGE_MS,
-} from "../src/lifecycle.ts";
-import {
   database,
   fixture,
   insert,
@@ -55,21 +48,6 @@ test("fastest and cheapest use independent comparable measurements; payer pin wi
       selectOperator([{ ...a, healthy: false }, b], { payer: a.payer, now }),
     /unavailable/,
   );
-});
-test("outages keep their start time, expire ownership, and archive after24h", async () => {
-  const now = Date.now(),
-    row = await fixture({ NEIRO_MINT: mint }, now);
-  const first = lifecycleFailure(row, "offline", now),
-    second = lifecycleFailure({ ...row, ...first }, "offline", now + 60000);
-  assert.equal(first.offlineSince, second.offlineSince);
-  assert.equal(
-    shouldArchive(
-      { ...row, status: "disabled", ...second },
-      now + ARCHIVE_AFTER_MS,
-    ),
-    true,
-  );
-  assert.equal(ownershipFresh(row, now + OWNERSHIP_MAX_AGE_MS), false);
 });
 async function setup(t) {
   const db = database(),
@@ -136,9 +114,9 @@ test("an upstream transport failure is returned without replay", async (t) => {
   assert.equal(r.status, 503);
   assert.equal(calls, 1);
 });
-test("expired ownership is hidden by default and cannot receive pinned RPC", async (t) => {
+test("expired listing is hidden by default and cannot receive pinned RPC", async (t) => {
   const { env, row, db } = await setup(t);
-  row.verifiedAt = Date.now() - OWNERSHIP_MAX_AGE_MS;
+  row.listing.checkedAt = Date.now() - 900000;
   db.sql
     .prepare("UPDATE operators SET data=? WHERE id=?")
     .run(JSON.stringify(row), row.id);
@@ -154,7 +132,7 @@ test("expired ownership is hidden by default and cannot receive pinned RPC", asy
   await ctx.finish();
   const [inactive] = (await r.json()).operators;
   assert.equal(inactive.eligible, false);
-  assert.equal(inactive.failureReason, "ownership-check-expired");
+  assert.equal(inactive.failureReason, "listing-expired-or-unchecked");
   ctx = context();
   r = await worker.fetch(
     request(
@@ -166,4 +144,23 @@ test("expired ownership is hidden by default and cannot receive pinned RPC", asy
   );
   await ctx.finish();
   assert.equal(r.status, 503);
+});
+
+test("sign-only operators route signTransaction; signAndSend requires capability without replay",async(t)=>{
+ const {db,env,row}=await setup(t);row.enabledMethods={sign_transaction:true,sign_and_send_transaction:false};
+ db.sql.prepare('UPDATE operators SET data=? WHERE id=?').run(JSON.stringify(row),row.id);
+ const calls=[];t.mock.method(globalThis,'fetch',async(_url,options)=>{calls.push(options.body);return Response.json({jsonrpc:'2.0',id:1,result:{ok:true}})});
+ const ctx=context();
+ const raw=JSON.stringify({jsonrpc:'2.0',id:1,method:'signTransaction',params:{}});
+ assert.equal((await worker.fetch(request('/rpc',raw),env,ctx)).status,200);
+ const unsupported=JSON.stringify({jsonrpc:'2.0',id:2,method:'signAndSendTransaction',params:{}});
+ assert.equal((await worker.fetch(request('/rpc',unsupported),env,ctx)).status,503);
+ assert.deepEqual(calls,[raw]);await ctx.finish();
+});
+test("unknown JSON-RPC methods pass through and old enrollment is gone",async(t)=>{
+ const {env}=await setup(t);let n=0;
+ t.mock.method(globalThis,'fetch',async()=>{n++;return Response.json({jsonrpc:'2.0',id:1,error:{code:-32601,message:'upstream method error'}})});
+ const ctx=context();const raw=JSON.stringify({jsonrpc:'2.0',id:1,method:'futureKoraMethod',params:{hello:'world'}});
+ const res=await worker.fetch(request('/rpc',raw),env,ctx);assert.equal(res.status,200);assert.equal((await res.json()).error.code,-32601);assert.equal(n,1);
+ const removed=await worker.fetch(request('/operators/register',JSON.stringify({url:'https://arbitrary.example.com'})),env,context());assert.equal(removed.status,404);assert.equal(n,1);await ctx.finish();
 });

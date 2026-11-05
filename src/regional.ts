@@ -15,6 +15,7 @@ import type {
 } from "./types.js";
 import { summarizeSubmissions } from "./submission.js";
 import { configCheck } from "./policy.js";
+import { listingConfigMatches } from "./directory.js";
 import { upstream } from "./upstream.js";
 import { boundedSetting } from "./lifecycle.js";
 
@@ -315,6 +316,8 @@ export async function refreshRegional(
         { signer_address: row.payer, payment_address: row.paymentAddress },
         env.NEIRO_MINT,
       );
+      if (!listingConfigMatches(row, response.value.result!))
+        throw Error("Listing terms changed");
       const value = {
         latencyMs: response.ms,
         at: Date.now(),

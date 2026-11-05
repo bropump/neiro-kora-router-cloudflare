@@ -80,7 +80,7 @@ test("funding evidence expires, binds RPC scope and respects sampled SOL fee", a
       row,
       await fundingScope({
         ...env,
-        FUNDING_RPC_URL: "https://other.example.com",
+        SOLANA_RPC_URL: "https://other.example.com",
       }),
     ),
     "funding-stale-or-unchecked",
@@ -107,40 +107,12 @@ test("one invalid legacy identity is isolated from a healthy funding batch", asy
   assert.equal(states[1].ready, true);
   assert.equal(calls.length, 3);
 });
-test("payment operators must expose both supported signing paths", () => {
-  const identity = { signer_address: payer, payment_address: payer };
-  assert.equal(configCheck(config, identity, mint).payer, payer);
-  assert.throws(
-    () =>
-      configCheck(
-        {
-          ...config,
-          enabled_methods: {
-            ...config.enabled_methods,
-            sign_transaction: false,
-          },
-        },
-        identity,
-        mint,
-      ),
-    /methods unavailable/,
-  );
-});
-
- test("readiness reuses activity RPC unless a dedicated funding RPC is set", async (t) => {
-  for (const dedicated of [false, true]) {
-    const env = { NEIRO_MINT: mint, ACTIVITY_RPC_URL: "https://activity.example.com", ...(dedicated ? { FUNDING_RPC_URL: "https://funding.example.com" } : {}) };
-    const row = await fixture(env);
-    const expected = dedicated ? env.FUNDING_RPC_URL : env.ACTIVITY_RPC_URL;
-    t.mock.method(globalThis, "fetch", async (url, options) => {
-      assert.equal(url, expected);
-      const q = JSON.parse(options.body);
-      const result = q.method === "getGenesisHash" ? MAINNET_GENESIS : q.method === "getMinimumBalanceForRentExemption" ? 1488440 : { context: { slot: 101 }, value: accounts() };
-      return Response.json({ jsonrpc: "2.0", id: 1, result });
-    });
-    const [state] = await checkFunding(env, [row]);
-    assert.equal(state.ready, true);
-    assert.equal(state.scope, await fundingScope({ NEIRO_MINT: mint, FUNDING_RPC_URL: expected }));
-    t.mock.restoreAll();
-  }
+test("either signing method is sufficient; neither is rejected", () => {
+ const identity={signer_address:payer,payment_address:payer};
+ for(const method of ["sign_transaction","sign_and_send_transaction"]){
+ const c=structuredClone(config);c.enabled_methods[method]=false;
+ assert.equal(configCheck(c,identity,mint).payer,payer);
+ }
+ const c=structuredClone(config);c.enabled_methods.sign_transaction=false;c.enabled_methods.sign_and_send_transaction=false;
+ assert.throws(()=>configCheck(c,identity,mint),/signing unavailable/);
 });

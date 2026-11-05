@@ -4,8 +4,6 @@ export const REQUIRED = [
   "get_config",
   "get_payer_signer",
   "estimate_transaction_fee",
-  "sign_transaction",
-  "sign_and_send_transaction",
 ];
 export function endpoint(raw: unknown, ownHosts: string[] = []) {
   if (typeof raw !== "string" || raw.length > 256 || raw.trim() !== raw)
@@ -82,7 +80,13 @@ export function configCheck(
   for (const m of REQUIRED)
     if (config.enabled_methods?.[m] !== true)
       throw Error("Kora methods unavailable");
-  if (!config.validation_config?.allowed_spl_paid_tokens?.includes(mint))
+  if (
+    !config.enabled_methods?.sign_transaction &&
+    !config.enabled_methods?.sign_and_send_transaction
+  )
+    throw Error("Kora signing unavailable");
+  const paid = config.validation_config?.allowed_spl_paid_tokens;
+  if (paid !== "All" && !paid?.includes(mint))
     throw Error("Required payment token unavailable");
   return {
     payer: identity.signer_address as string,

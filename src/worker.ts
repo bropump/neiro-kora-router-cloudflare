@@ -1,21 +1,9 @@
-import {
-  acknowledgedSignatures,
-  recordActivity,
-  activityFeed,
-  reconcileActivity,
-} from "./activity.js";
-import { dashboard, measurements } from "./dashboard.js";
-import { isRecord } from "./types.js";
 import type {
   CachedRows,
-  ConfiguredOperator,
   ConfigEvent,
   Env,
-  KoraIdentity,
   Operator,
-  OperatorStatus,
   ReadEnv,
-  Registration,
   RpcEnvelope,
   RpcRequest,
   Settings,
@@ -27,14 +15,13 @@ import {
   noteSubmission,
   SUBMISSION_MAX_AGE_MS,
 } from "./submission.js";
-import { endpoint, bodyJSON, bounded, json } from "./policy.js";
+import { bounded, json } from "./policy.js";
+import { forward } from "./upstream.js";
 import {
-  inspect,
-  ownership,
-  upstream,
-  forward,
-  hostingRegions,
-} from "./upstream.js";
+  syncDirectory,
+  listingFresh,
+  listingConfigMatches,
+} from "./directory.js";
 import { selectOperator, normalizePrice } from "./selection.js";
 import {
   loadRegional,
@@ -43,304 +30,12 @@ import {
   localFailureUntil,
 } from "./regional.js";
 import { probeQuote, transactionPayer } from "./probe.js";
-import {
-  checkFunding,
-  fundingExclusion,
-  fundingScope,
-  refreshFunding,
-} from "./readiness.js";
-import {
-  lifecycleFailure,
-  ownershipFresh,
-  publicOperators,
-  ARCHIVE_AFTER_MS,
-  boundedSetting,
-} from "./lifecycle.js";
-const hash = async (s: string) =>
-  [
-    ...new Uint8Array(
-      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)),
-    ),
-  ]
-    .map((x) => x.toString(16).padStart(2, "0"))
-    .join("");
-async function budget(env: Env, key: string, max: number) {
-  const now = Date.now();
-  const result = await env.DB.prepare(
-    "INSERT INTO limits (id,n,reset) VALUES (?,1,?) ON CONFLICT(id) DO UPDATE SET n=CASE WHEN reset<=? THEN 1 ELSE n+1 END, reset=CASE WHEN reset<=? THEN ? ELSE reset END WHERE reset<=? OR n<? RETURNING n",
-  )
-    .bind(key, now + 3600000, now, now, now + 3600000, now, max)
-    .first();
-  return !!result;
-}
-function configuredOperators(env: Settings): ConfiguredOperator[] {
-  const entries: unknown = JSON.parse(env.CONFIGURED_OPERATORS || "[]");
-  if (!Array.isArray(entries)) throw Error("Invalid configured operators");
-  return (entries as unknown[]).map((x) => {
-    if (
-      !isRecord(x) ||
-      typeof x.payer !== "string" ||
-      typeof x.paymentAddress !== "string" ||
-      ![x.payer, x.paymentAddress].every((v) =>
-        /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v),
-      )
-    )
-      throw Error("Invalid configured identity");
-    return {
-      url: endpoint(x.url, (env.ROUTER_HOSTS || "").split(",")),
-      hostingRegions: hostingRegions(x.hostingRegions),
-      payer: x.payer,
-      paymentAddress: x.paymentAddress,
-    };
-  });
-}
-async function check(
-  env: Env,
-  row: Registration,
-  identityOnly = false,
-  attempt: number,
-) {
-  let failureReason = "ownership-proof-unavailable-or-invalid";
-  try {
-    const configured = configuredOperators(env).find((x) => x.url === row.url);
-    if (!configured && !(await ownership(row))) {
-      await removeOperator(env, row.id);
-      row.status = "removed";
-      return;
-    }
-    failureReason = "kora-identity-or-config-invalid";
-    if (configured) row.hostingRegions = configured.hostingRegions || [];
-    if (
-      identityOnly &&
-      row.payer &&
-      row.paymentAddress &&
-      row.verifiedAt &&
-      row.status !== "disabled"
-    ) {
-      const identity = (await upstream<KoraIdentity>(row.url, "getPayerSigner"))
-        .value.result;
-      if (
-        identity?.signer_address !== row.payer ||
-        identity.payment_address !== row.paymentAddress
-      )
-        throw Error("Operator identity changed");
-      // Refresh ownership metadata without restoring a stale health/status snapshot.
-      await env.DB.prepare(
-        "UPDATE operators SET data=json_set(data,'$.verifiedAt',?,'$.hostingRegions',json(?)) WHERE id=? AND last_attempt=?",
-      )
-        .bind(
-          Date.now(),
-          JSON.stringify(row.hostingRegions || []),
-          row.id,
-          attempt,
-        )
-        .run();
-      return;
-    }
-    const measured = await inspect(row.url, env.NEIRO_MINT);
-    if (
-      configured &&
-      (measured.payer !== configured.payer ||
-        measured.paymentAddress !== configured.paymentAddress)
-    )
-      throw Error("Configured operator identity changed");
-    if (
-      row.payer &&
-      (row.payer !== measured.payer ||
-        row.paymentAddress !== measured.paymentAddress)
-    )
-      throw Error("Operator identity changed; remove and re-register");
-    const now = Date.now();
-    failureReason = "funding-check-failed";
-    const [funding] = await checkFunding(env, [{ ...row, ...measured }]);
-    // Periodic account refresh may finish while admission is waiting on RPC.
-    // Preserve newer evidence and evaluate that retained state before activation.
-    const retained = await env.DB.prepare(
-      "UPDATE operators SET data=json_set(data,'$.funding',CASE WHEN COALESCE(json_extract(data,'$.funding.at'),0)>? THEN json_extract(data,'$.funding') ELSE json(?) END) WHERE id=? AND last_attempt=? RETURNING data",
-    )
-      .bind(funding.at, JSON.stringify(funding), row.id, attempt)
-      .first<StoredOperator>();
-    if (!retained) return;
-    const current = JSON.parse(retained.data) as Operator;
-    const fundingFailure = fundingExclusion(
-      { ...current, ...measured },
-      await fundingScope(env),
-    );
-    if (fundingFailure) {
-      failureReason = fundingFailure;
-      throw Error(fundingFailure);
-    }
-    const updated = await env.DB.prepare(
-      `UPDATE operators SET status='active',checked_at=?,data=json_set(data,
- '$.status','active','$.healthy',json('true'),'$.checkedAt',?,'$.verifiedAt',?,
- '$.identityBoundAt',COALESCE(json_extract(data,'$.identityBoundAt'),CASE WHEN json_extract(data,'$.payer') IS NOT NULL THEN created_at ELSE ? END),
- '$.payer',?,'$.paymentAddress',?,'$.latencyMs',?,'$.price',json(?),'$.hostingRegions',json(?),
- '$.lastSuccessfulAt',?,'$.offlineSince',NULL,'$.failureReason',NULL,'$.failures',0,'$.nextCheckAt',0,'$.archivedAt',NULL) WHERE id=? AND last_attempt=? AND checked_at<=? AND json_extract(data,'$.funding.at')=? RETURNING status`,
-    )
-      .bind(
-        measured.checkedAt,
-        measured.checkedAt,
-        now,
-        now,
-        measured.payer,
-        measured.paymentAddress,
-        measured.latencyMs,
-        JSON.stringify(measured.price ?? null),
-        JSON.stringify(row.hostingRegions || []),
-        now,
-        row.id,
-        attempt,
-        measured.checkedAt,
-        current.funding!.at,
-      )
-      .first<{ status: OperatorStatus }>();
-    if (updated) row.status = "active";
-  } catch (e) {
-    const now = Date.now(),
-      status = row.status === "pending" ? "pending" : "disabled";
-    const failure = lifecycleFailure(row, failureReason, now);
-    const updated = await env.DB.prepare(
-      "UPDATE operators SET status=?,checked_at=?,data=json_patch(json_set(data,'$.status',?,'$.healthy',json('false'),'$.checkedAt',?),json(?)) WHERE id=? AND last_attempt=? RETURNING status",
-    )
-      .bind(status, now, status, now, JSON.stringify(failure), row.id, attempt)
-      .first<{ status: OperatorStatus }>();
-    if (updated) row.status = status;
-    throw e;
-  }
-}
-async function removeOperator(env: Env, id: string) {
-  await env.DB.batch([
-    env.DB.prepare("DELETE FROM operators WHERE id=?").bind(id),
-    env.DB.prepare("DELETE FROM regional_stats WHERE operator_id=?").bind(id),
-    env.DB.prepare(
-      "DELETE FROM operator_observations WHERE operator_id=?",
-    ).bind(id),
-  ]);
-}
+import { fundingExclusion, fundingScope, refreshFunding } from "./readiness.js";
+import { publicOperators } from "./lifecycle.js";
 function positiveSetting(env: Settings, key: keyof Settings, fallback: number) {
   const n = Number(env[key] ?? fallback);
   if (!Number.isSafeInteger(n) || n < 1) throw Error("Invalid " + key);
   return n;
-}
-async function enroll(
-  action: string,
-  input: { url?: unknown; id?: unknown },
-  ip: string,
-  env: Env,
-) {
-  if (
-    !(await budget(
-      env,
-      "ip:" + (await hash(ip)),
-      positiveSetting(env, "ADMISSION_REQUESTS_PER_IP_HOUR", 60),
-    ))
-  )
-    return json({ error: "Registration limit reached; try later" }, 429);
-  if (action === "register") {
-    const url = endpoint(input.url, (env.ROUTER_HOSTS || "").split(",")),
-      id = (await hash(url)).slice(0, 32);
-    await env.DB.prepare(
-      "DELETE FROM operators WHERE status='pending' AND created_at<?",
-    )
-      .bind(Date.now() - 900000)
-      .run();
-    let stored = await env.DB.prepare("SELECT data FROM operators WHERE id=?")
-      .bind(id)
-      .first<StoredOperator>();
-    if (!stored) {
-      const row: Registration = {
-        id,
-        url,
-        token: crypto.randomUUID() + crypto.randomUUID(),
-        status: "pending",
-        createdAt: Date.now(),
-        checkedAt: 0,
-      };
-      await env.DB.prepare(
-        "INSERT OR IGNORE INTO operators (id,host,status,created_at,checked_at,last_attempt,data) VALUES (?,?,?,?,?,?,?)",
-      )
-        .bind(
-          id,
-          new URL(url).hostname,
-          "pending",
-          row.createdAt,
-          0,
-          0,
-          JSON.stringify(row),
-        )
-        .run();
-      stored = await env.DB.prepare("SELECT data FROM operators WHERE id=?")
-        .bind(id)
-        .first<StoredOperator>();
-      if (!stored)
-        return json({ error: "Registration could not be stored" }, 409);
-    }
-    const row = JSON.parse(stored.data) as Registration;
-    return json({
-      id: row.id,
-      status: row.status,
-      verificationUrl: new URL("/.well-known/neiro-router/" + id, url).href,
-      verification: { token: row.token, enabled: true },
-      next: "Serve this JSON at verificationUrl, then POST /operators/verify with id. Keep the file available; no wallet signature or daily renewal.",
-    });
-  }
-  if (action === "remove") {
-    if (typeof input.id !== "string" || !/^[a-f0-9]{32}$/.test(input.id))
-      return json({ error: "Invalid registration ID" }, 400);
-    const stored = await env.DB.prepare("SELECT data FROM operators WHERE id=?")
-      .bind(input.id)
-      .first<StoredOperator>();
-    if (!stored) return json({ error: "Unknown registration" }, 404);
-    const row = JSON.parse(stored.data) as Registration;
-    if (configuredOperators(env).some((x) => x.url === row.url))
-      return json(
-        {
-          error:
-            "Configured operator must be removed from deployment configuration",
-        },
-        409,
-      );
-    // An ID or public token alone grants no authority: verify the owner-controlled HTTPS proof.
-    if ((await ownership(row)) !== false)
-      return json(
-        { error: "Set enabled:false in the ownership proof before removal" },
-        409,
-      );
-    await removeOperator(env, row.id);
-    return json({ id: row.id, status: "removed" });
-  }
-  if (action === "verify") {
-    if (typeof input.id !== "string" || !/^[a-f0-9]{32}$/.test(input.id))
-      return json({ error: "Invalid registration ID" }, 400);
-    const now = Date.now();
-    const stored = await env.DB.prepare(
-      "UPDATE operators SET last_attempt=? WHERE id=? AND last_attempt<? RETURNING data",
-    )
-      .bind(now, input.id, now - 60000)
-      .first<StoredOperator>();
-    if (!stored)
-      return json(
-        { error: "Unknown registration or verification cooldown" },
-        429,
-      );
-    const row = JSON.parse(stored.data) as Registration;
-    if (env.ENROLLMENT_OPEN !== "true" && row.status === "pending")
-      return json({ error: "Enrollment closed" }, 503);
-    try {
-      await check(env, row, false, now);
-      return json({ id: row.id, status: row.status });
-    } catch {
-      return json(
-        {
-          id: row.id,
-          status: row.status,
-          error: "Verification or Kora health failed",
-        },
-        422,
-      );
-    }
-  }
-  return json({ error: "Not found" }, 404);
 }
 // Minute cron prunes abandoned state in bounded batches. Keep a 15-minute
 // grace beyond active measurements and lease deadlines; never delete live leases.
@@ -362,70 +57,6 @@ export async function pruneRoutingState(env: Env, now = Date.now()) {
     ).bind(cutoff),
   ]);
 }
-async function maintain(env: Env) {
-  const now = Date.now();
-  await pruneRoutingState(env, now);
-  // Retain the identity binding; retirement must not let another URL take it over.
-  await env.DB.prepare(
-    "UPDATE operators SET status='archived',data=json_set(data,'$.status','archived','$.healthy',json('false'),'$.archivedAt',?) WHERE id IN (SELECT id FROM operators WHERE status IN ('offline','disabled') AND json_extract(data,'$.offlineSince')>0 AND json_extract(data,'$.offlineSince')<=? ORDER BY json_extract(data,'$.offlineSince'),id LIMIT 100)",
-  )
-    .bind(now, now - ARCHIVE_AFTER_MS)
-    .run();
-  // Deployment-owned public endpoints are trusted admission configuration, not
-  // a flag accepted through registration. Identity is rechecked on every refresh.
-  for (const entry of configuredOperators(env)) {
-    const id = (await hash(entry.url)).slice(0, 32),
-      row: Registration = {
-        ...entry,
-        id,
-        status: "offline",
-        token: "",
-        createdAt: now,
-        checkedAt: 0,
-        healthy: false,
-      };
-    await env.DB.prepare(
-      `INSERT INTO operators(id,host,status,created_at,checked_at,last_attempt,data) VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status='offline',checked_at=0,data=json_set(operators.data,'$.status','offline','$.checkedAt',0) WHERE operators.status='pending'`,
-    )
-      .bind(
-        id,
-        new URL(entry.url).hostname,
-        "offline",
-        now,
-        0,
-        0,
-        JSON.stringify(row),
-      )
-      .run();
-  }
-  await env.DB.batch([
-    env.DB.prepare(
-      "DELETE FROM operators WHERE status='pending' AND created_at<?",
-    ).bind(now - 900000),
-    env.DB.prepare("DELETE FROM limits WHERE reset<?").bind(now),
-  ]);
-  const rows = await env.DB.prepare(
-    "SELECT id FROM operators WHERE status NOT IN ('pending','archived') AND COALESCE(json_extract(data,'$.nextCheckAt'),0)<=? AND (COALESCE(json_extract(data,'$.verifiedAt'),0)<? OR status='disabled') ORDER BY last_attempt,id LIMIT ?",
-  )
-    .bind(
-      now,
-      now - 600000,
-      boundedSetting(env, "MAINTENANCE_BATCH_SIZE", 10, 25),
-    )
-    .all<{ id: string }>();
-  for (let i = 0; i < rows.results.length; i += 4)
-    await Promise.all(
-      rows.results.slice(i, i + 4).map(async ({ id }) => {
-        const stored = await env.DB.prepare(
-          "UPDATE operators SET last_attempt=? WHERE id=? AND last_attempt<? RETURNING data",
-        )
-          .bind(now, id, now - 60000)
-          .first<StoredOperator>();
-        if (stored)
-          await check(env, JSON.parse(stored.data), true, now).catch(() => {});
-      }),
-    );
-}
 export async function recordConfig(
   env: Env,
   origin: string,
@@ -439,7 +70,10 @@ export async function recordConfig(
   row = JSON.parse(current.data) as Operator;
   const exclusion = event.ok
     ? fundingExclusion(row, await fundingScope(env)) ||
-      (!ownershipFresh(row) ? "ownership-check-expired" : null)
+      (!listingFresh(row) ? "listing-expired-or-unchecked" : null) ||
+      (!listingConfigMatches(row, event.config)
+        ? "listing-config-mismatch"
+        : null)
     : "kora-config-unavailable";
   const ready = event.ok && !exclusion;
   const status = ready ? "active" : "offline";
@@ -449,10 +83,11 @@ export async function recordConfig(
     `UPDATE operators SET status=?,checked_at=?,data=json_set(data,
  '$.status',?,'$.healthy',json(?),'$.checkedAt',?,'$.price',
  CASE WHEN ? THEN json(?) ELSE json_extract(data,'$.price') END,
+ '$.enabledMethods',CASE WHEN ? THEN json(?) ELSE json_extract(data,'$.enabledMethods') END,
  '$.lastSuccessfulAt',CASE WHEN ? THEN ? ELSE json_extract(data,'$.lastSuccessfulAt') END,
  '$.offlineSince',CASE WHEN ? THEN NULL ELSE COALESCE(json_extract(data,'$.offlineSince'),?) END,
  '$.failureReason',?)
- WHERE id=? AND status IN ('active','offline') AND checked_at<=? AND COALESCE(json_extract(data,'$.verifiedAt'),0)=? AND COALESCE(json_extract(data,'$.funding.at'),0)=?`,
+ WHERE id=? AND status IN ('active','offline') AND checked_at<=? AND COALESCE(json_extract(data,'$.listing.checkedAt'),0)=? AND COALESCE(json_extract(data,'$.funding.at'),0)=?`,
   )
     .bind(
       status,
@@ -464,6 +99,8 @@ export async function recordConfig(
       JSON.stringify(
         (event.ok ? event.config.validation_config?.price : null) ?? null,
       ),
+      event.ok ? 1 : 0,
+      JSON.stringify(event.ok ? event.config.enabled_methods : {}),
       ready ? 1 : 0,
       event.at,
       ready ? 1 : 0,
@@ -471,16 +108,19 @@ export async function recordConfig(
       exclusion,
       row.id,
       event.at,
-      row.verifiedAt || 0,
+      row.listing?.checkedAt || 0,
       row.funding?.at || 0,
     )
     .run();
   // Successful refreshes do not evict the local routing snapshot.
-  if (!ready) await caches.default.delete(new Request(origin + "/_pool-v2"));
+  if (!ready)
+    await caches.default.delete(new Request(origin + "/_pool-onchain-v1"));
 }
 const refresh = (rows: Operator[], env: Env, origin: string, region: string) =>
   refreshRegional(
-    rows.filter((row) => ["active", "offline"].includes(row.status)),
+    rows.filter(
+      (row) => listingFresh(row) && ["active", "offline"].includes(row.status),
+    ),
     env,
     origin,
     region,
@@ -488,7 +128,9 @@ const refresh = (rows: Operator[], env: Env, origin: string, region: string) =>
     { onConfig: (row, event) => recordConfig(env, origin, row, event) },
   );
 async function scheduledRefresh(env: Env) {
-  await maintainIfDue(env);
+  await syncDirectory(env);
+  await refreshFunding(env);
+  await pruneRoutingState(env);
   const origin =
     "https://" + (env.ROUTER_HOSTS || "router.invalid").split(",")[0];
   const stored = await env.DB.prepare(
@@ -501,33 +143,16 @@ async function scheduledRefresh(env: Env) {
     "SCHEDULED",
   );
 }
-async function maintainIfDue(env: Env) {
-  const now = Date.now();
-  const lease = await env.DB.prepare(
-    `INSERT INTO regional_leases(id,n,reset) VALUES ('directory-maintenance',1,?) ON CONFLICT(id) DO UPDATE SET reset=excluded.reset WHERE regional_leases.reset<=? RETURNING id`,
-  )
-    .bind(now + 60000, now)
-    .first();
-  if (lease) await maintain(env);
-}
 async function pool(env: ReadEnv, ctx: ExecutionContext, origin: string) {
-  const key = new Request(origin + "/_pool-v2"),
-    refreshKey = new Request(origin + "/_pool-refresh-v2");
-  const configured = new Map(
-    configuredOperators(env).map((row) => [row.url, row]),
-  );
+  const key = new Request(origin + "/_pool-onchain-v1"),
+    refreshKey = new Request(origin + "/_pool-onchain-refresh-v1");
   const fresh = (rows: Operator[]) =>
     rows.map((row) => ({
       ...row,
-      configured: configured.has(row.url),
-      // Apply current display metadata even when the pool snapshot predates it.
-      hostingRegions: configured.has(row.url)
-        ? configured.get(row.url)!.hostingRegions || []
-        : row.hostingRegions || [],
       healthy:
         row.status === "active" &&
         row.healthy === true &&
-        ownershipFresh(row) &&
+        listingFresh(row) &&
         row.checkedAt <= Date.now() &&
         row.checkedAt > Date.now() - 300000,
     }));
@@ -542,8 +167,7 @@ async function pool(env: ReadEnv, ctx: ExecutionContext, origin: string) {
     const value = {
       at,
       rows: result.results.map((r) => {
-        const { token, ...row } = JSON.parse(r.data) as Operator;
-        return row;
+        return JSON.parse(r.data) as Operator;
       }),
     };
     await caches.default.put(
@@ -581,15 +205,15 @@ function regionalCandidates(rows: Operator[], region: string, scope: string) {
       ...row,
       healthy:
         row.healthy &&
-        ownershipFresh(row, now) &&
+        listingFresh(row, now) &&
         !fundingExclusion(row, scope, now) &&
         row.failedUntil! <= now &&
         !(fresh && c.failed),
       failureReason:
         row.status === "archived"
           ? "archived-after-prolonged-outage"
-          : !ownershipFresh(row, now)
-            ? "ownership-check-expired"
+          : !listingFresh(row, now)
+            ? "listing-expired-or-unchecked"
             : fundingExclusion(row, scope, now) ||
               (fresh && c.failed
                 ? "local-config-check-failed"
@@ -607,24 +231,7 @@ function regionalCandidates(rows: Operator[], region: string, scope: string) {
 }
 export default {
   async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(
-      refreshFunding(env).catch(() => console.error("funding_refresh_failed")),
-    );
     ctx.waitUntil(scheduledRefresh(env));
-    ctx.waitUntil(
-      reconcileActivity(env).catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : "unknown";
-        console.error("activity_confirmation_failed", {
-          name: error instanceof Error ? error.name : typeof error,
-          reason:
-            /^(Signature status RPC HTTP \d{3}|Invalid signature status response)$/.test(
-              message,
-            )
-              ? message
-              : "unclassified",
-        });
-      }),
-    );
   },
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -646,7 +253,7 @@ export default {
     if (url.pathname === "/healthz")
       return json({
         ok: true,
-        mode: "url-enrollment",
+        mode: "onchain-discovery",
         colo: request.cf?.colo || "unknown",
       });
     if (
@@ -657,78 +264,6 @@ export default {
       ).success
     )
       return json({ error: "Request limit reached" }, 429);
-    if (url.pathname === "/network/activity" && request.method === "GET") {
-      const key = new Request(url.origin + "/_network-activity");
-      const cached = await caches.default.match(key);
-      if (cached) return cached;
-      try {
-        const response = json(await activityFeed(routingEnv()));
-        response.headers.set("cache-control", "public, max-age=30");
-        ctx.waitUntil(caches.default.put(key, response.clone()));
-        return response;
-      } catch {
-        return json({ error: "Activity unavailable" }, 503);
-      }
-    }
-    if (url.pathname === "/dashboard" && request.method === "GET")
-      return new Response(dashboard, {
-        headers: {
-          "content-type": "text/html; charset=utf-8",
-          "content-security-policy":
-            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
-          "x-content-type-options": "nosniff",
-          "referrer-policy": "no-referrer",
-        },
-      });
-    if (url.pathname === "/network/measurements" && request.method === "GET") {
-      const key = new Request(url.origin + "/_dashboard-measurements");
-      const cached = await caches.default.match(key);
-      if (cached) return cached;
-      try {
-        const response = json(await measurements(routingEnv()));
-        response.headers.set("cache-control", "public, max-age=30");
-        ctx.waitUntil(caches.default.put(key, response.clone()));
-        return response;
-      } catch {
-        return json({ error: "Measurements unavailable" }, 503);
-      }
-    }
-    if (
-      [
-        "/operators/register",
-        "/operators/verify",
-        "/operators/remove",
-      ].includes(url.pathname)
-    ) {
-      if (
-        url.pathname === "/operators/register" &&
-        env.ENROLLMENT_OPEN !== "true"
-      )
-        return json({ error: "Enrollment closed" }, 503);
-      if (request.method !== "POST")
-        return json({ error: "POST required" }, 405);
-      try {
-        const value = (await bodyJSON(request)) as {
-          url?: unknown;
-          id?: unknown;
-        };
-        const result = await enroll(
-          url.pathname.split("/").at(-1)!,
-          value,
-          request.headers.get("cf-connecting-ip") || "unknown",
-          env,
-        );
-        if (url.pathname !== "/operators/register")
-          await Promise.all(
-            ["/_pool-v2", "/_pool-refresh-v2"].map((path) =>
-              caches.default.delete(new Request(url.origin + path)),
-            ),
-          );
-        return result;
-      } catch {
-        return json({ error: "Invalid request" }, 400);
-      }
-    }
     if (url.pathname === "/operators" && request.method === "GET") {
       try {
         const region = request.cf?.colo || "unknown",
@@ -749,7 +284,8 @@ export default {
           ).map((r) => ({
             id: r.id,
             payer: r.payer,
-            hostingRegions: r.hostingRegions || [],
+            listing: r.listing,
+            enabledMethods: r.enabledMethods,
             eligible: !!r.healthy,
             status: r.status,
             lastSuccessfulAt: r.lastSuccessfulAt ?? null,
@@ -865,6 +401,16 @@ export default {
           },
           400,
         );
+      // Match only known signing capabilities; all other JSON-RPC methods pass through.
+      const required = calls.flatMap((call) => {
+        if (call.method === "signTransaction") return ["sign_transaction"];
+        if (call.method === "signAndSendTransaction")
+          return ["sign_and_send_transaction"];
+        return [];
+      });
+      for (const row of rows)
+        if (required.some((method) => row.enabledMethods?.[method] !== true))
+          row.healthy = false;
       const mode = url.searchParams.get("selection") || "fastest",
         priceGroup = url.searchParams.get("priceGroup") || undefined;
       // Exclude locally observed failures before sending anything upstream.
@@ -895,15 +441,6 @@ export default {
         positiveSetting(env, "UPSTREAM_TIMEOUT_MS", 30000),
         positiveSetting(env, "MAX_RPC_RESPONSE_BYTES", 1048576),
       );
-      if (result.status >= 200 && result.status < 300) {
-        const signatures = acknowledgedSignatures(body, result.value);
-        if (signatures.length)
-          ctx.waitUntil(
-            recordActivity(env, chosen.id, signatures).catch(() =>
-              console.error("activity_record_failed"),
-            ),
-          );
-      }
       const responseValue = result.value as RpcEnvelope | undefined;
       if (submissionBody)
         ctx.waitUntil(

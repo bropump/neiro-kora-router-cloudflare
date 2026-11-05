@@ -8,3 +8,5 @@ node_modules/
 *keypair*.json
 *secret*.json
 .DS_Store
+
+.codex/

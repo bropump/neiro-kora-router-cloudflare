@@ -96,25 +96,6 @@ export function selectOperator(
     typeof row.id === "string" &&
     row.id &&
     fresh(row.checkedAt, now, healthMaxAgeMs);
-  // Reported payer identity is not a cryptographic ownership proof. Preserve
-  // the first verified binding so a later duplicate cannot disable/displace it.
-  // Configured endpoints take priority; explicit operator IDs can select a
-  // deliberate alternative without silently failing over signed transactions.
-  const boundAt = (row: Operator) =>
-    validTime(row.identityBoundAt)
-      ? row.identityBoundAt
-      : validTime(row.createdAt)
-        ? row.createdAt
-        : 0;
-  const bindings = new Map<string, Operator>();
-  for (const row of [...rows].sort(
-    (a, b) =>
-      Number(!!b.configured) - Number(!!a.configured) ||
-      boundAt(a) - boundAt(b) ||
-      a.id.localeCompare(b.id),
-  )) {
-    if (!bindings.has(row.payer)) bindings.set(row.payer, row);
-  }
   let candidates: Operator[];
   if (operatorId !== undefined) {
     candidates = rows.filter(
@@ -126,7 +107,7 @@ export function selectOperator(
     if (candidates.length !== 1) throw Error("Selected provider unavailable");
     return { ...candidates[0], selectionBasis: "pinned" };
   }
-  candidates = [...bindings.values()].filter(eligible);
+  candidates = rows.filter(eligible);
   if (payer !== undefined) {
     const chosen = candidates.find((row) => row.payer === payer);
     if (!chosen) throw Error("Selected provider unavailable");

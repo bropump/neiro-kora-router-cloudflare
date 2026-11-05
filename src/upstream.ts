@@ -1,9 +1,4 @@
-import type {
-  KoraConfig,
-  KoraIdentity,
-  Registration,
-  RpcEnvelope,
-} from "./types.js";
+import type { KoraConfig, KoraIdentity, RpcEnvelope } from "./types.js";
 import { bounded, configCheck } from "./policy.js";
 // Optional owner-reported display metadata. Never used for routing or eligibility.
 export function hostingRegions(value: unknown): string[] {
@@ -57,27 +52,6 @@ export async function inspect(url: string, mint: string) {
     healthy: true,
   };
 }
-export async function ownership(row: Registration) {
-  const u = new URL(row.url);
-  u.pathname = "/.well-known/neiro-router/" + row.id;
-  u.search = "";
-  const response = await fetch(u, {
-    redirect: "manual",
-    signal: AbortSignal.timeout(5000),
-    headers: { accept: "application/json" },
-  });
-  if (!response.ok) throw Error("Ownership proof unavailable");
-  const proof = JSON.parse(await bounded(response, 4096)) as {
-    token?: unknown;
-    enabled?: unknown;
-    hostingRegions?: unknown;
-  };
-  if (proof.token !== row.token || typeof proof.enabled !== "boolean")
-    throw Error("Ownership proof mismatch");
-  row.hostingRegions = hostingRegions(proof.hostingRegions);
-  return proof.enabled;
-}
-
 // Customer JSON is forwarded exactly as received, including transaction strings,
 // IDs and parameters. The router does not add signer_key or rewrite transactions.
 export async function forward(

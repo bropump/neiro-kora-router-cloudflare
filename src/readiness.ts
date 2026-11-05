@@ -23,9 +23,7 @@ export interface Funding {
   reason: string | null;
 }
 const endpoint = (env: Settings) =>
-  env.FUNDING_RPC_URL ||
-  env.ACTIVITY_RPC_URL ||
-  "https://api.mainnet-beta.solana.com";
+  env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 export async function fundingScope(env: Settings) {
   const digest = await crypto.subtle.digest(
     "SHA-256",
@@ -287,8 +285,10 @@ export async function refreshFunding(env: Env) {
   if (!claimed) return;
   const rows = (
     await env.DB.prepare(
-      "SELECT data FROM operators WHERE status IN ('active','offline') AND json_extract(data,'$.payer') IS NOT NULL ORDER BY COALESCE(json_extract(data,'$.funding.at'),0),id LIMIT 50",
-    ).all<{ data: string }>()
+      "SELECT data FROM operators WHERE status IN ('active','offline') AND json_extract(data,'$.payer') IS NOT NULL AND json_extract(data,'$.listing.checkedAt')>? AND json_extract(data,'$.listing.expiresAt')>? ORDER BY COALESCE(json_extract(data,'$.funding.at'),0),id LIMIT 50",
+    )
+      .bind(now - 900000, now)
+      .all<{ data: string }>()
   ).results.map((x) => JSON.parse(x.data) as Registration);
   for (let i = 0; i < rows.length; i += 25) {
     const batch = rows.slice(i, i + 25),

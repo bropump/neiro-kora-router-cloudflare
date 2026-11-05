@@ -22,6 +22,7 @@ export const config = {
   ),
   validation_config: {
     allowed_spl_paid_tokens: [mint],
+    price_source: "Jupiter",
     price: { type: "free" },
   },
 };
@@ -76,7 +77,8 @@ export async function fixture(env, now = Date.now()) {
   return {
     id: "fixture-operator",
     url: "https://kora.example.com/",
-    token: "fixture-token",
+    listing: {record: "fixture", anchorSlot: 100, checkedAt: now, expiresAt: now+86400000, terms: { price: {type:"free"}, oracle:"Jupiter" }},
+    enabledMethods: config.enabled_methods,
     payer,
     paymentAddress: payer,
     status: "active",

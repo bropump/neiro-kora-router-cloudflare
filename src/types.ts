@@ -1,18 +1,11 @@
 /** Types for router-owned state. Network JSON remains untrusted at runtime. */
 export interface Settings {
-  FUNDING_RPC_URL?: string;
-  ACTIVITY_RPC_URL?: string;
-  ENROLLMENT_OPEN?: string;
+  SOLANA_RPC_URL?: string;
   NEIRO_MINT: string;
   ROUTER_HOSTS?: string;
-  CONFIGURED_OPERATORS?: string;
-  ADMISSION_REQUESTS_PER_IP_HOUR?: string;
-  MAINTENANCE_BATCH_SIZE?: string;
   CONFIG_CHECK_CONCURRENCY?: string;
   REGIONAL_CONFIG_BATCH_SIZE?: string;
   REGIONAL_PROBE_INTERVAL_MS?: string;
-  ACTIVITY_RETENTION_DAYS?: string;
-  ACTIVITY_CHECK_BATCHES?: string;
   MAX_RPC_BODY_BYTES?: string;
   MAX_RPC_RESPONSE_BYTES?: string;
   UPSTREAM_TIMEOUT_MS?: string;
@@ -27,10 +20,17 @@ export interface ReadEnv extends Settings {
 export type OperatorStatus =
   "pending" | "active" | "offline" | "disabled" | "archived" | "removed";
 export interface Registration {
+  listing?: {
+    record: string;
+    anchorSlot: number;
+    expiresAt: number;
+    checkedAt: number;
+    terms: Record<string, unknown>;
+  };
+  enabledMethods?: Record<string, unknown>;
   hostingRegions?: string[];
   id: string;
   url: string;
-  token?: string;
   status: OperatorStatus;
   createdAt: number;
   checkedAt: number;
@@ -52,7 +52,6 @@ export interface Registration {
 export interface Operator extends Registration {
   payer: string;
   paymentAddress: string;
-  configured?: boolean;
   failedUntil?: number;
   sampleQuote?: Sample | null;
   sampleStats?: Sample | null;
@@ -61,12 +60,6 @@ export interface Operator extends Registration {
   configStats?: ConfigStats | null;
   selectionBasis?: string;
   latencyBasis?: string;
-}
-export interface ConfiguredOperator {
-  hostingRegions?: string[];
-  url: string;
-  payer: string;
-  paymentAddress: string;
 }
 export interface Sample {
   ok: boolean;
@@ -152,7 +145,11 @@ export interface RpcRequest {
 export interface KoraConfig {
   fee_payers?: unknown;
   enabled_methods?: Record<string, unknown>;
-  validation_config?: { allowed_spl_paid_tokens?: string[]; price?: unknown };
+  validation_config?: {
+    allowed_spl_paid_tokens?: string[] | "All";
+    price?: unknown;
+    price_source?: unknown;
+  };
 }
 export interface KoraIdentity {
   signer_address?: unknown;
