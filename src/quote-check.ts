@@ -65,7 +65,14 @@ export function checkQuotes(
     )
       return invalid();
     const token = isRecord(call.params) ? call.params.fee_token : undefined;
-    const amount = unsignedAmount(quote.fee_in_token);
+    // Kora may omit token conversion for a genuinely free (zero-lamport) quote.
+    const amount =
+      quote.fee_in_token == null &&
+      isRecord(row.price) &&
+      row.price.type === "free" &&
+      unsignedAmount(quote.fee_in_lamports) === 0n
+        ? 0n
+        : unsignedAmount(quote.fee_in_token);
     if (token !== undefined && (typeof token !== "string" || amount === null))
       return invalid();
     if (quote.fee_in_token != null && amount === null) return invalid();

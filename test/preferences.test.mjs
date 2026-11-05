@@ -55,3 +55,8 @@ test('mixed batches remain passthrough without a cap; cap rejects them before fo
  assert.equal(checkQuotes(batch,[reply({signer_pubkey:'wrong'}),{jsonrpc:'2.0',id:2,result:{}}],row),null);
  assert.throws(()=>checkQuoteRequest(batch,'100',mint));
 });
+test('free zero-cost quote may omit token amount; a paid quote may not',async()=>{
+ const row=await fixture({NEIRO_MINT:mint});assert.equal(checkQuotes(quoteCall,reply({fee_in_lamports:0,fee_in_token:null}),row,'0'),null);
+ assert.equal(checkQuotes(quoteCall,reply({fee_in_token:null}),row,'0').status,502);
+ assert.equal(checkQuotes(quoteCall,reply({fee_in_lamports:0,fee_in_token:null}),{...row,price:{type:'margin',margin:0}},'0').status,502);
+});
