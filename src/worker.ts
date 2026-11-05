@@ -1,3 +1,9 @@
+import {
+  preferences,
+  matchesPreferences,
+  PreferenceError,
+} from "./preferences.js";
+import { checkQuoteRequest, checkQuotes } from "./quote-check.js";
 import type {
   CachedRows,
   ConfigEvent,
@@ -229,6 +235,20 @@ function regionalCandidates(rows: Operator[], region: string, scope: string) {
     };
   });
 }
+async function chooseAvailable(
+  rows: Operator[],
+  options: Parameters<typeof selectOperator>[1],
+  origin: string,
+  region: string,
+) {
+  for (let attempt = 0; attempt <= rows.length; attempt++) {
+    const chosen = selectOperator(rows, options);
+    if ((await localFailureUntil(origin, region, chosen.id)) <= Date.now())
+      return chosen;
+    rows.find((row) => row.id === chosen.id)!.healthy = false;
+  }
+  throw Error("Selected provider unavailable");
+}
 export default {
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil(scheduledRefresh(env));
@@ -264,6 +284,79 @@ export default {
       ).success
     )
       return json({ error: "Request limit reached" }, 429);
+    if (url.pathname === "/select" && request.method === "GET") {
+      try {
+        const prefs = preferences(url.searchParams),
+          region = request.cf?.colo || "unknown";
+        const base = await pool(routingEnv(), ctx, url.origin);
+        ctx.waitUntil(refresh(base, env, url.origin, region).catch(() => {}));
+        const rows = regionalCandidates(
+          await loadRegional(base, routingEnv(), url.origin, region, ctx),
+          region,
+          await fundingScope(env),
+        );
+        for (const row of rows)
+          if (!matchesPreferences(row, prefs)) row.healthy = false;
+        const chosen = await chooseAvailable(
+          rows,
+          {
+            mode: url.searchParams.get("selection") || "fastest",
+            payer: url.searchParams.get("provider") || undefined,
+            operatorId: url.searchParams.get("operator") || undefined,
+            priceGroup: url.searchParams.get("priceGroup") || undefined,
+            region,
+          },
+          url.origin,
+          region,
+        );
+        const pinned = new URL("/rpc", url.origin);
+        for (const key of ["selection", "priceGroup", "maxMarkupBps", "method"])
+          if (url.searchParams.has(key))
+            pinned.searchParams.set(key, url.searchParams.get(key)!);
+        pinned.searchParams.set("provider", chosen.payer);
+        pinned.searchParams.set("operator", chosen.id);
+        const rpcUrl = pinned.href;
+        if (prefs.maxFeeNeiroRaw !== undefined)
+          pinned.searchParams.set("maxFeeNeiroRaw", prefs.maxFeeNeiroRaw);
+        return json({
+          provider: chosen.payer,
+          operator: chosen.id,
+          paymentAddress: chosen.paymentAddress,
+          rpcUrl,
+          quoteUrl: pinned.href,
+          preferences: prefs,
+          measurementColo: region,
+          selectionBasis: chosen.selectionBasis,
+          latencySource: chosen.latencyBasis || "pinned",
+          advertisedPrice: normalizePrice(chosen.price),
+          checkedAt: chosen.checkedAt,
+          listingExpiresAt: chosen.listing?.expiresAt,
+          sampleQuote: chosen.sampleQuote
+            ? {
+                ...chosen.sampleQuote,
+                stale: Date.now() - chosen.sampleQuote.at >= 660000,
+              }
+            : null,
+          feeCapScope:
+            prefs.maxFeeNeiroRaw === undefined
+              ? null
+              : "actual unsigned quote response only; client must verify final transaction",
+        });
+      } catch (error) {
+        const badInput =
+          error instanceof PreferenceError ||
+          (error instanceof Error &&
+            error.message === "Invalid selection options");
+        return json(
+          {
+            error: badInput
+              ? (error as Error).message
+              : "No eligible operator matches the requested preferences",
+          },
+          badInput ? 400 : 503,
+        );
+      }
+    }
     if (url.pathname === "/operators" && request.method === "GET") {
       try {
         const region = request.cf?.colo || "unknown",
@@ -349,6 +442,8 @@ export default {
       )
         return json({ error: "Invalid JSON-RPC request" }, 400);
       id = batch ? null : ((body as RpcRequest).id ?? null);
+      const prefs = preferences(url.searchParams);
+      checkQuoteRequest(body, prefs.maxFeeNeiroRaw, env.NEIRO_MINT);
       const baseRows = await pool(routingEnv(), ctx, url.origin);
       ctx.waitUntil(refresh(baseRows, env, url.origin, region).catch(() => {}));
       const rows = regionalCandidates(
@@ -409,27 +504,21 @@ export default {
         return [];
       });
       for (const row of rows)
-        if (required.some((method) => row.enabledMethods?.[method] !== true))
+        if (
+          !matchesPreferences(row, prefs) ||
+          required.some((method) => row.enabledMethods?.[method] !== true)
+        )
           row.healthy = false;
       const mode = url.searchParams.get("selection") || "fastest",
         priceGroup = url.searchParams.get("priceGroup") || undefined;
       // Exclude locally observed failures before sending anything upstream.
       // Usually one cache read; explicit pins still fail instead of switching payer.
-      for (let attempt = 0; attempt <= rows.length; attempt++) {
-        chosen = selectOperator(rows, {
-          mode,
-          payer: specified[0],
-          operatorId,
-          priceGroup,
-          region,
-        });
-        if (
-          (await localFailureUntil(url.origin, region, chosen.id)) <= Date.now()
-        )
-          break;
-        rows.find((row) => row.id === chosen!.id)!.healthy = false;
-        chosen = undefined;
-      }
+      chosen = await chooseAvailable(
+        rows,
+        { mode, payer: specified[0], operatorId, priceGroup, region },
+        url.origin,
+        region,
+      );
       isQuote =
         !batch && (body as RpcRequest).method === "estimateTransactionFee";
       submissionBody = submissionRequest(body) ? body : undefined;
@@ -441,6 +530,31 @@ export default {
         positiveSetting(env, "UPSTREAM_TIMEOUT_MS", 30000),
         positiveSetting(env, "MAX_RPC_RESPONSE_BYTES", 1048576),
       );
+      if (result.status >= 200 && result.status < 300) {
+        const failure = checkQuotes(
+          body,
+          result.value,
+          chosen,
+          prefs.maxFeeNeiroRaw,
+        );
+        if (failure) {
+          if (failure.status === 502)
+            ctx.waitUntil(
+              noteQuote(chosen, env, url.origin, region, {
+                ok: false,
+                kind: "protocol",
+              }).catch(() => {}),
+            );
+          return json(
+            {
+              jsonrpc: "2.0",
+              id,
+              error: { code: failure.code, message: failure.message },
+            },
+            failure.status,
+          );
+        }
+      }
       const responseValue = result.value as RpcEnvelope | undefined;
       if (submissionBody)
         ctx.waitUntil(
@@ -505,6 +619,11 @@ export default {
         },
       });
     } catch (e) {
+      if (e instanceof PreferenceError)
+        return json(
+          { jsonrpc: "2.0", id, error: { code: -32602, message: e.message } },
+          400,
+        );
       if (chosen && submissionBody && forwardStarted !== undefined)
         ctx.waitUntil(
           noteSubmission(chosen, env, url.origin, region, {

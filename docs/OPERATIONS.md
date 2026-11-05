@@ -59,3 +59,35 @@ work test, not proof that every row stays fresh or that 1,000 live operators wor
 D1 stores public listings, funding evidence and bounded timing data, not customer
 transactions or transaction signatures. Regional reads use D1 Sessions and local
 Workers Cache API. Use `GET /operators?includeInactive=true` to diagnose exclusions.
+
+## Simple selection and quote preferences
+
+`GET /select?selection=fastest&maxMarkupBps=500&method=signTransaction`
+returns the chosen identity, pricing, sample age data, listing expiry, `rpcUrl`
+and `quoteUrl`. Both URLs pin the operator; reuse `rpcUrl` for ordinary Kora calls.
+The same markup/method filters work on `/rpc`, including pinned calls. No match
+returns 503; preferences are never silently relaxed. `maxMarkupBps=500` means 5%:
+free operators qualify, percentage prices must be <=5%, and fixed fees are excluded
+because they cannot be compared to a percentage without transaction costs.
+
+Optional `maxFeeNeiroRaw=5000000` means 5 NEIRO (six decimal places). On `/select`
+it is carried into `quoteUrl`, not enforced against a sample price and not added
+to `rpcUrl`. On `/rpc` it is accepted only for a single `estimateTransactionFee`
+request with an ID and explicit NEIRO `fee_token`. Other methods or batches with
+a cap are rejected before forwarding; a signing response cannot enforce a fee
+cap after submission. Use an unsigned transaction when requesting a quote.
+
+Single quote responses are checked for JSON-RPC ID, selected signer, published
+payment address and valid nonnegative integer fee amounts. When present, a returned
+fee-token field must match the requested token. Standard Kora quotes do not echo
+the mint: its unit context comes from the request, not an independent conversion
+proof. Safe integer numbers and decimal u64 strings are supported; imprecise numeric
+amounts are rejected. A cap breach returns 422, malformed/mismatched quote 502,
+invalid options 400. Kora's own errors and accepted responses remain unchanged.
+Neither rejection retries another operator. Arbitrary uncapped batches retain
+passthrough behaviour without per-quote checking; do not mix quote checking with
+payment submission. Notifications provide no response to verify.
+
+These checks do not calculate prices, lock quotes, inspect reimbursement instructions,
+verify arbitrary programs or enforce final onchain charges. The client must verify
+the transaction and fee before signing. Kora retains its own signing policy.

@@ -9,7 +9,14 @@ POST https://YOUR-WORKER/rpc                       # fastest (default)
 POST https://YOUR-WORKER/rpc?selection=cheapest    # lowest comparable sample fee
 POST https://YOUR-WORKER/rpc?provider=PAYER       # pin an operator
 GET  https://YOUR-WORKER/operators
+GET  https://YOUR-WORKER/select?selection=fastest&maxMarkupBps=500&method=signTransaction
 ```
+
+`/select` returns pinned `rpcUrl` and `quoteUrl` values. Optionally include
+`maxFeeNeiroRaw` (integer base units; 1000000 = 1 NEIRO) to cap the actual quote
+through `quoteUrl`. Use `rpcUrl` for signing and submission. Single quote responses
+receive identity/amount checks and are returned unchanged or rejected. Clients
+still verify the final transaction; this is not a binding price or signing policy.
 
 Send ordinary Kora JSON-RPC. Requests and responses are forwarded unchanged;
 the router never signs, changes transaction bytes or retries a submitted request.
