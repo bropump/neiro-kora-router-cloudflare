@@ -164,3 +164,20 @@ test("unknown JSON-RPC methods pass through and old enrollment is gone",async(t)
  const res=await worker.fetch(request('/rpc',raw),env,ctx);assert.equal(res.status,200);assert.equal((await res.json()).error.code,-32601);assert.equal(n,1);
  const removed=await worker.fetch(request('/operators/register',JSON.stringify({url:'https://arbitrary.example.com'})),env,context());assert.equal(removed.status,404);assert.equal(n,1);await ctx.finish();
 });
+
+test('expired cached funding re-reads D1 before routing, without probing operators',async(t)=>{
+ const {env,row}=await setup(t),now=Date.now(),ctx=context();
+ const old=await fixture(env,now-240000);
+ // At snapshot creation (65s ago), funding was 175s old and still eligible.
+ await caches.default.put(new Request('https://router.example/_pool-onchain-v1'),Response.json({at:now-65000,rows:[old]}));
+ const sent=[];t.mock.method(globalThis,'fetch',async(url,options)=>{sent.push(url);return Response.json({jsonrpc:'2.0',id:1,result:{version:'test'}})});
+ const r=await worker.fetch(request('/rpc',JSON.stringify({jsonrpc:'2.0',id:1,method:'getVersion'})),env,ctx);
+ assert.equal(r.status,200);assert.deepEqual(sent,[row.url]);await ctx.finish();
+});
+test('already stale operators do not force a directory read on every request',async(t)=>{
+ const {env,db}=await setup(t),old=await fixture(env,Date.now()-240000);
+ db.sql.prepare('UPDATE operators SET data=? WHERE id=?').run(JSON.stringify(old),old.id);
+ t.mock.method(globalThis,'fetch',()=>assert.fail('no foreground probe'));
+ let ctx=context();await worker.fetch(request('/operators'),env,ctx);await ctx.finish();const reads=db.calls;
+ ctx=context();await worker.fetch(request('/operators'),env,ctx);await ctx.finish();assert.equal(db.calls,reads);
+});

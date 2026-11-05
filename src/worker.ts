@@ -182,6 +182,25 @@ async function pool(env: ReadEnv, ctx: ExecutionContext, origin: string) {
     );
     return value.rows;
   }
+  // Do not serve a newly expired eligibility snapshot while fresher evidence
+  // may already be in D1. Refresh once on the transition, not on every request
+  // for an operator that was already offline when the snapshot was loaded.
+  const usableAt = (row: Operator, at: number) =>
+    row.status === "active" &&
+    row.healthy === true &&
+    listingFresh(row, at) &&
+    row.checkedAt <= at &&
+    at - row.checkedAt < 300000 &&
+    !fundingExclusion(row, row.funding?.scope || "", at);
+  if (
+    previous &&
+    age >= 0 &&
+    age < 120000 &&
+    previous.rows.some(
+      (row) => usableAt(row, previous.at) && !usableAt(row, Date.now()),
+    )
+  )
+    return fresh(await update());
   if (age >= 0 && age < 60000) return fresh(previous!.rows);
   if (age >= 60000 && age < 120000) {
     ctx.waitUntil(
